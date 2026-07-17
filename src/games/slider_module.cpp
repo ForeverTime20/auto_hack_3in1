@@ -17,7 +17,7 @@
 #include <vector>
 #include <cwchar>
 
-namespace gta3::games::slider {
+namespace gta5::games::slider {
 namespace {
 
 constexpr UINT WM_APP_LOG = WM_APP + 1;
@@ -2244,4 +2244,4 @@ LRESULT CALLBACK HudProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) { re
 LRESULT CALLBACK CursorWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) { return CursorProc(hwnd, msg, wParam, lParam); }
 LRESULT CALLBACK MarksWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) { return MarksProc(hwnd, msg, wParam, lParam); }
 
-}  // namespace gta3::games::slider
+}  // namespace gta5::games::slider

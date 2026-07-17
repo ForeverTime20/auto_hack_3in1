@@ -6,7 +6,7 @@
 #include <string>
 #include <thread>
 
-namespace gta3::games::slider {
+namespace gta5::games::slider {
 void SetHostWindow(HWND hwnd);
 void SetHudWindow(HWND hwnd);
 void SetCursorWindow(HWND hwnd);
@@ -47,9 +47,9 @@ void SetHudStatusText(const std::wstring& text);
 LRESULT CALLBACK HudProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 LRESULT CALLBACK CursorWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 LRESULT CALLBACK MarksWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
-}  // namespace gta3::games::slider
+}  // namespace gta5::games::slider
 
-namespace gta3::games::flashing {
+namespace gta5::games::flashing {
 bool DetectInGame();
 HWND OverlayWindow();
 void SetOverlayWindow(HWND hwnd);
@@ -58,9 +58,9 @@ bool RunSession(const std::function<bool()>& stopRequested,
                 const std::function<bool()>& overlayEnabled,
                 const std::function<void(const std::wstring&)>& status);
 LRESULT CALLBACK OverlayWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
-}  // namespace gta3::games::flashing
+}  // namespace gta5::games::flashing
 
-namespace gta3::games::fingerprint {
+namespace gta5::games::fingerprint {
 bool DetectInGame();
 HWND OverlayWindow();
 void SetOverlayWindow(HWND hwnd);
@@ -72,4 +72,4 @@ bool RunSession(const std::function<bool()>& stopRequested,
                 const std::function<bool()>& overlayEnabled,
                 const std::function<void(const std::wstring&)>& status);
 LRESULT CALLBACK OverlayWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
-}  // namespace gta3::games::fingerprint
+}  // namespace gta5::games::fingerprint

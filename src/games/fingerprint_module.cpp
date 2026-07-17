@@ -20,7 +20,7 @@
 #include <thread>
 #include <vector>
 
-namespace gta3::games::fingerprint {
+namespace gta5::games::fingerprint {
 
 struct Rect {
     int x = 0, y = 0, w = 0, h = 0;
@@ -941,9 +941,9 @@ static void sendScanCode(WORD scanCode, bool keyUp = false, bool extended = fals
 
 static void tapScanCode(WORD scanCode, bool extended = false) {
     sendScanCode(scanCode, false, extended);
-    Sleep((DWORD)gta3::games::slider::TapHoldMs());
+    Sleep((DWORD)gta5::games::slider::TapHoldMs());
     sendScanCode(scanCode, true, extended);
-    Sleep((DWORD)gta3::games::slider::TapGapMs());
+    Sleep((DWORD)gta5::games::slider::TapGapMs());
 }
 
 static void tapUp() { tapScanCode(0x48, true); }
@@ -1667,4 +1667,4 @@ bool RunSession(const std::function<bool()>& stopRequested,
   return completedAnyLevel;
 }
 
-}  // namespace gta3::games::fingerprint
+}  // namespace gta5::games::fingerprint

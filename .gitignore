@@ -1,4 +1,5 @@
 # Build outputs
+build.ps1
 *.exe
 *.dll
 *.obj

@@ -14,17 +14,18 @@ The app detects the active supported minigame, shows a small HUD/overlay, and us
 - MinGW-w64 with `g++.exe`
 - PowerShell
 
-By default, `build.ps1` looks for `C:\mingw64\bin\g++.exe`, then falls back to `g++.exe` on `PATH`. You can also set `CXX` to a compiler path:
-
-```powershell
-$env:CXX = "C:\path\to\g++.exe"
-.\build.ps1
-```
+Make sure `g++.exe` is available on `PATH`, or replace `g++` in the command below with the full compiler path.
 
 ## Build
 
 ```powershell
-.\build.ps1
+g++ -std=c++17 -O2 -static -static-libgcc -static-libstdc++ -municode -mwindows `
+  src\main.cpp `
+  src\games\slider_module.cpp `
+  src\games\flashing_module.cpp `
+  src\games\fingerprint_module.cpp `
+  -lgdi32 -luser32 -lshell32 -lcomctl32 -ldwmapi `
+  -o auto_hack_3in1.exe
 ```
 
 The compiled executable is written to:
@@ -57,4 +58,4 @@ tap_gap_ms=18
 
 ## Repository Notes
 
-Generated binaries, logs, and local settings are excluded from version control. Commit the source files, build script, README, example config, `.gitignore`, and `.gitattributes`.
+Generated binaries, local build scripts, logs, and local settings are excluded from version control. Commit the source files, README, example config, `.gitignore`, and `.gitattributes`.

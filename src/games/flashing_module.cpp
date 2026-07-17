@@ -21,7 +21,7 @@
 #include <vector>
 #include <functional>
 
-namespace gta3::games::flashing {
+namespace gta5::games::flashing {
 
 static const int GRID_ROWS = 5;
 static const int GRID_COLS = 6;
@@ -880,7 +880,7 @@ static void PressScanCode(WORD scanCode, bool extended = false) {
     input.ki.wScan = scanCode;
     input.ki.dwFlags = KEYEVENTF_SCANCODE | (extended ? KEYEVENTF_EXTENDEDKEY : 0);
     SendInput(1, &input, sizeof(INPUT));
-    Sleep((DWORD)gta3::games::slider::TapHoldMs());
+    Sleep((DWORD)gta5::games::slider::TapHoldMs());
 
     input.ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP | (extended ? KEYEVENTF_EXTENDEDKEY : 0);
     SendInput(1, &input, sizeof(INPUT));
@@ -978,14 +978,14 @@ static void TickAutoInput() {
     auto sendKeys = [&] {
         for (WORD key : keys) {
             PressGameKey(key);
-            Sleep((DWORD)gta3::games::slider::TapGapMs());
+            Sleep((DWORD)gta5::games::slider::TapGapMs());
         }
     };
 
     g.autoMessage = L"Sending column";
     sendKeys();
     DWORD settleMs = static_cast<DWORD>(keys.size()) *
-        ((DWORD)gta3::games::slider::TapHoldMs() + (DWORD)gta3::games::slider::TapGapMs());
+        ((DWORD)gta5::games::slider::TapHoldMs() + (DWORD)gta5::games::slider::TapGapMs());
     g.nextInputAt = GetTickCount64() + settleMs + 120;
 
     g.lastSubmittedCol = selectedCol;
@@ -1407,4 +1407,4 @@ bool RunSession(const std::function<bool()>& stopRequested,
   return completedAnyLevel;
 }
 
-}  // namespace gta3::games::flashing
+}  // namespace gta5::games::flashing

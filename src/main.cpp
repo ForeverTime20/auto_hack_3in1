@@ -50,28 +50,28 @@ std::wstring GameName(GameKind game) {
 }
 
 bool OverlayEnabled() {
-  return gta3::games::slider::OverlayEnabled();
+  return gta5::games::slider::OverlayEnabled();
 }
 
 void HideAllGameOverlays() {
-  gta3::games::slider::HideTransientOverlays();
-  gta3::games::flashing::HideOverlay();
-  gta3::games::fingerprint::ClearOverlay();
+  gta5::games::slider::HideTransientOverlays();
+  gta5::games::flashing::HideOverlay();
+  gta5::games::fingerprint::ClearOverlay();
 }
 
 GameKind DetectGame() {
-  if (gta3::games::slider::DetectInGame()) return GameKind::Slider;
-  if (gta3::games::flashing::DetectInGame()) return GameKind::Flashing;
-  if (gta3::games::fingerprint::DetectInGame()) return GameKind::Fingerprint;
+  if (gta5::games::slider::DetectInGame()) return GameKind::Slider;
+  if (gta5::games::flashing::DetectInGame()) return GameKind::Flashing;
+  if (gta5::games::fingerprint::DetectInGame()) return GameKind::Fingerprint;
   return GameKind::None;
 }
 
 void PostStatus(const std::wstring& text) {
-  gta3::games::slider::PostModuleStatus(text);
+  gta5::games::slider::PostModuleStatus(text);
 }
 
 void PostLog(const std::wstring& text) {
-  gta3::games::slider::PostModuleLog(text);
+  gta5::games::slider::PostModuleLog(text);
 }
 
 void AddTrayIcon(HWND hwnd) {
@@ -96,23 +96,23 @@ void RemoveTrayIcon(HWND hwnd) {
 }
 
 void ShowHudFromTray() {
-  HWND hud = gta3::games::slider::HudWindow();
+  HWND hud = gta5::games::slider::HudWindow();
   if (!hud) return;
   ShowWindow(hud, SW_SHOWNA);
   SetWindowPos(hud, HWND_TOPMOST, 0, 0, 0, 0,
                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-  gta3::games::slider::RepaintHud();
+  gta5::games::slider::RepaintHud();
 }
 
 void WorkerMain() {
   using Clock = std::chrono::steady_clock;
-  gta3::games::slider::PostModuleLog(L"start");
-  gta3::games::slider::PostModuleStatus(L"searching minigame");
+  gta5::games::slider::PostModuleLog(L"start");
+  gta5::games::slider::PostModuleStatus(L"searching minigame");
   HideAllGameOverlays();
 
   const auto deadline = Clock::now() + std::chrono::seconds(20);
   bool completed = false;
-  while (!gta3::games::slider::StopRequested() && Clock::now() < deadline) {
+  while (!gta5::games::slider::StopRequested() && Clock::now() < deadline) {
     GameKind game = DetectGame();
     if (game == GameKind::None) {
       Sleep(30);
@@ -123,19 +123,19 @@ void WorkerMain() {
     PostStatus(L"running " + GameName(game));
     switch (game) {
       case GameKind::Slider:
-        gta3::games::slider::RunSession();
+        gta5::games::slider::RunSession();
         completed = true;
         break;
       case GameKind::Flashing:
-        completed = gta3::games::flashing::RunSession(
-            [] { return gta3::games::slider::StopRequested(); },
-            [] { return gta3::games::slider::OverlayEnabled(); },
+        completed = gta5::games::flashing::RunSession(
+            [] { return gta5::games::slider::StopRequested(); },
+            [] { return gta5::games::slider::OverlayEnabled(); },
             [](const std::wstring& text) { PostStatus(text); });
         break;
       case GameKind::Fingerprint:
-        completed = gta3::games::fingerprint::RunSession(
-            [] { return gta3::games::slider::StopRequested(); },
-            [] { return gta3::games::slider::OverlayEnabled(); },
+        completed = gta5::games::fingerprint::RunSession(
+            [] { return gta5::games::slider::StopRequested(); },
+            [] { return gta5::games::slider::OverlayEnabled(); },
             [](const std::wstring& text) { PostStatus(text); });
         break;
       default:
@@ -144,7 +144,7 @@ void WorkerMain() {
     break;
   }
 
-  if (!completed && !gta3::games::slider::StopRequested() && Clock::now() >= deadline) {
+  if (!completed && !gta5::games::slider::StopRequested() && Clock::now() >= deadline) {
     PostLog(L"timeout: no supported minigame detected in 20s");
     PostStatus(L"detect timeout; stopped");
   } else {
@@ -152,48 +152,48 @@ void WorkerMain() {
   }
 
   HideAllGameOverlays();
-  gta3::games::slider::MarkRunning(false);
+  gta5::games::slider::MarkRunning(false);
   PostMessageW(g_host, kMsgWorkerDone, 0, 0);
 }
 
 void StartWorker() {
-  if (gta3::games::slider::Running()) return;
-  gta3::games::slider::ResetStopFlag();
-  gta3::games::slider::HideTransientOverlays();
-  gta3::games::slider::MarkRunning(true);
-  gta3::games::slider::UpdatePreviewRunning(true);
-  gta3::games::slider::SetHudStatusText(L"starting");
+  if (gta5::games::slider::Running()) return;
+  gta5::games::slider::ResetStopFlag();
+  gta5::games::slider::HideTransientOverlays();
+  gta5::games::slider::MarkRunning(true);
+  gta5::games::slider::UpdatePreviewRunning(true);
+  gta5::games::slider::SetHudStatusText(L"starting");
   PostStatus(L"starting");
-  gta3::games::slider::RepaintHud();
-  gta3::games::slider::WorkerThread() = std::thread(WorkerMain);
-  gta3::games::slider::RepaintHud();
+  gta5::games::slider::RepaintHud();
+  gta5::games::slider::WorkerThread() = std::thread(WorkerMain);
+  gta5::games::slider::RepaintHud();
 }
 
 void StopWorker() {
-  if (!gta3::games::slider::Running()) return;
-  gta3::games::slider::SetHudStatusText(L"stopping");
+  if (!gta5::games::slider::Running()) return;
+  gta5::games::slider::SetHudStatusText(L"stopping");
   PostStatus(L"stopping");
-  gta3::games::slider::RepaintHud();
-  gta3::games::slider::RequestStop();
+  gta5::games::slider::RepaintHud();
+  gta5::games::slider::RequestStop();
   HideAllGameOverlays();
-  auto& worker = gta3::games::slider::WorkerThread();
+  auto& worker = gta5::games::slider::WorkerThread();
   if (worker.joinable()) worker.join();
-  gta3::games::slider::MarkRunning(false);
-  gta3::games::slider::UpdatePreviewRunning(false);
+  gta5::games::slider::MarkRunning(false);
+  gta5::games::slider::UpdatePreviewRunning(false);
   PostStatus(L"stopped");
-  gta3::games::slider::RepaintHud();
+  gta5::games::slider::RepaintHud();
 }
 
 LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
   switch (msg) {
     case WM_CREATE:
-      gta3::games::slider::ApplyHotkey(hwnd);
+      gta5::games::slider::ApplyHotkey(hwnd);
       AddTrayIcon(hwnd);
       return 0;
     case WM_HOTKEY:
-      if (static_cast<int>(wp) == gta3::games::slider::HotkeyId()) {
-        if (gta3::games::slider::IsListeningHotkey()) return 0;
-        if (gta3::games::slider::Running()) StopWorker();
+      if (static_cast<int>(wp) == gta5::games::slider::HotkeyId()) {
+        if (gta5::games::slider::IsListeningHotkey()) return 0;
+        if (gta5::games::slider::Running()) StopWorker();
         else StartWorker();
         return 0;
       }
@@ -202,21 +202,21 @@ LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       std::unique_ptr<std::wstring> text(reinterpret_cast<std::wstring*>(lp));
       OutputDebugStringW(text->c_str());
       OutputDebugStringW(L"\n");
-      gta3::games::slider::SetHudLogText(*text);
-      gta3::games::slider::RepaintHud();
+      gta5::games::slider::SetHudLogText(*text);
+      gta5::games::slider::RepaintHud();
       return 0;
     }
     case kMsgStatus: {
       std::unique_ptr<std::wstring> text(reinterpret_cast<std::wstring*>(lp));
-      gta3::games::slider::SetHudStatusText(*text);
-      gta3::games::slider::RepaintHud();
+      gta5::games::slider::SetHudStatusText(*text);
+      gta5::games::slider::RepaintHud();
       return 0;
     }
     case kMsgWorkerDone: {
-      gta3::games::slider::UpdatePreviewRunning(false);
-      auto& worker = gta3::games::slider::WorkerThread();
+      gta5::games::slider::UpdatePreviewRunning(false);
+      auto& worker = gta5::games::slider::WorkerThread();
       if (worker.joinable()) worker.detach();
-      gta3::games::slider::RepaintHud();
+      gta5::games::slider::RepaintHud();
       return 0;
     }
     case kMsgTray:
@@ -232,7 +232,7 @@ LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DESTROY:
       StopWorker();
       RemoveTrayIcon(hwnd);
-      UnregisterHotKey(hwnd, gta3::games::slider::HotkeyId());
+      UnregisterHotKey(hwnd, gta5::games::slider::HotkeyId());
       PostQuitMessage(0);
       return 0;
   }
@@ -249,7 +249,7 @@ void RegisterClasses(HINSTANCE inst) {
   RegisterClassW(&host);
 
   WNDCLASSW hud{};
-  hud.lpfnWndProc = gta3::games::slider::HudProc;
+  hud.lpfnWndProc = gta5::games::slider::HudProc;
   hud.hInstance = inst;
   hud.hCursor = LoadCursor(nullptr, IDC_ARROW);
   hud.hbrBackground = reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
@@ -257,7 +257,7 @@ void RegisterClasses(HINSTANCE inst) {
   RegisterClassW(&hud);
 
   WNDCLASSW cursor{};
-  cursor.lpfnWndProc = gta3::games::slider::CursorWindowProc;
+  cursor.lpfnWndProc = gta5::games::slider::CursorWindowProc;
   cursor.hInstance = inst;
   cursor.hCursor = LoadCursor(nullptr, IDC_ARROW);
   cursor.hbrBackground = reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
@@ -265,7 +265,7 @@ void RegisterClasses(HINSTANCE inst) {
   RegisterClassW(&cursor);
 
   WNDCLASSW marks{};
-  marks.lpfnWndProc = gta3::games::slider::MarksWindowProc;
+  marks.lpfnWndProc = gta5::games::slider::MarksWindowProc;
   marks.hInstance = inst;
   marks.hCursor = LoadCursor(nullptr, IDC_ARROW);
   marks.hbrBackground = reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
@@ -273,7 +273,7 @@ void RegisterClasses(HINSTANCE inst) {
   RegisterClassW(&marks);
 
   WNDCLASSW flashing{};
-  flashing.lpfnWndProc = gta3::games::flashing::OverlayWindowProc;
+  flashing.lpfnWndProc = gta5::games::flashing::OverlayWindowProc;
   flashing.hInstance = inst;
   flashing.hCursor = LoadCursor(nullptr, IDC_ARROW);
   flashing.hbrBackground = reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
@@ -281,7 +281,7 @@ void RegisterClasses(HINSTANCE inst) {
   RegisterClassW(&flashing);
 
   WNDCLASSW fingerprint{};
-  fingerprint.lpfnWndProc = gta3::games::fingerprint::OverlayWindowProc;
+  fingerprint.lpfnWndProc = gta5::games::fingerprint::OverlayWindowProc;
   fingerprint.hInstance = inst;
   fingerprint.hCursor = LoadCursor(nullptr, IDC_ARROW);
   fingerprint.hbrBackground = reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
@@ -293,15 +293,15 @@ bool CreateWindows(HINSTANCE inst) {
   g_host = CreateWindowExW(WS_EX_TOOLWINDOW, L"Gta3In1HostV2", L"Auto Hack 3in1 Host",
                            WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, inst, nullptr);
   if (!g_host) return false;
-  gta3::games::slider::SetHostWindow(g_host);
+  gta5::games::slider::SetHostWindow(g_host);
 
-  RECT hudRect = gta3::games::slider::InitialHudRect();
+  RECT hudRect = gta5::games::slider::InitialHudRect();
   HWND hud = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                              L"Gta3In1HudV2", L"Auto Hack 3in1 HUD",
                              WS_POPUP, hudRect.left, hudRect.top,
-                             gta3::games::slider::HudWidth(), gta3::games::slider::HudHeight(),
+                             gta5::games::slider::HudWidth(), gta5::games::slider::HudHeight(),
                              nullptr, nullptr, inst, nullptr);
-  gta3::games::slider::SetHudWindow(hud);
+  gta5::games::slider::SetHudWindow(hud);
   if (hud) {
     SetLayeredWindowAttributes(hud, RGB(0, 0, 0), 255, LWA_COLORKEY);
     ShowWindow(hud, SW_SHOWNA);
@@ -310,9 +310,9 @@ bool CreateWindows(HINSTANCE inst) {
   HWND cursor = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                                 L"Gta3In1CursorV2", L"Auto Hack 3in1 Cursor",
                                 WS_POPUP, hudRect.right + 12, hudRect.top,
-                                gta3::games::slider::CursorSize(), gta3::games::slider::CursorSize(),
+                                gta5::games::slider::CursorSize(), gta5::games::slider::CursorSize(),
                                 nullptr, nullptr, inst, nullptr);
-  gta3::games::slider::SetCursorWindow(cursor);
+  gta5::games::slider::SetCursorWindow(cursor);
   if (cursor) {
     SetLayeredWindowAttributes(cursor, RGB(0, 0, 0), 255, LWA_COLORKEY);
     ShowWindow(cursor, SW_HIDE);
@@ -322,7 +322,7 @@ bool CreateWindows(HINSTANCE inst) {
                                L"Gta3In1MarksV2", L"Auto Hack 3in1 Marks",
                                WS_POPUP, hudRect.right + 84, hudRect.top, 1, 1,
                                nullptr, nullptr, inst, nullptr);
-  gta3::games::slider::SetMarksWindow(marks);
+  gta5::games::slider::SetMarksWindow(marks);
   if (marks) {
     SetLayeredWindowAttributes(marks, RGB(0, 0, 0), 255, LWA_COLORKEY);
     ShowWindow(marks, SW_HIDE);
@@ -332,7 +332,7 @@ bool CreateWindows(HINSTANCE inst) {
                                   L"Gta3In1FlashingOverlayV2", L"Auto Hack 3in1 Flashing Overlay",
                                   WS_POPUP, 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN),
                                   nullptr, nullptr, inst, nullptr);
-  gta3::games::flashing::SetOverlayWindow(flashing);
+  gta5::games::flashing::SetOverlayWindow(flashing);
   if (flashing) {
     SetLayeredWindowAttributes(flashing, RGB(0, 0, 0), 255, LWA_COLORKEY);
     ShowWindow(flashing, SW_HIDE);
@@ -342,7 +342,7 @@ bool CreateWindows(HINSTANCE inst) {
                                      L"Gta3In1FingerprintOverlayV2", L"Auto Hack 3in1 Fingerprint Overlay",
                                      WS_POPUP, 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN),
                                      nullptr, nullptr, inst, nullptr);
-  gta3::games::fingerprint::SetOverlayWindow(fingerprint);
+  gta5::games::fingerprint::SetOverlayWindow(fingerprint);
   if (fingerprint) {
     SetLayeredWindowAttributes(fingerprint, RGB(0, 0, 0), 255, LWA_COLORKEY);
     ShowWindow(fingerprint, SW_HIDE);
@@ -367,14 +367,14 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     return 0;
   }
 
-  gta3::games::slider::LoadPersistentSettings();
-  gta3::games::fingerprint::SetUiThread();
-  gta3::games::fingerprint::InitStateLock();
+  gta5::games::slider::LoadPersistentSettings();
+  gta5::games::fingerprint::SetUiThread();
+  gta5::games::fingerprint::InitStateLock();
 
   RegisterClasses(inst);
   if (!CreateWindows(inst)) return 1;
 
-  PostLog(L"3-in-1 ready: press " + gta3::games::slider::HotkeyName() + L" to start/stop");
+  PostLog(L"3-in-1 ready: press " + gta5::games::slider::HotkeyName() + L" to start/stop");
   PostStatus(L"3-in-1 idle");
 
   MSG msg{};
@@ -383,7 +383,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     DispatchMessageW(&msg);
   }
 
-  gta3::games::fingerprint::DeleteStateLock();
+  gta5::games::fingerprint::DeleteStateLock();
   if (g_singleInstanceMutex) {
     ReleaseMutex(g_singleInstanceMutex);
     CloseHandle(g_singleInstanceMutex);
