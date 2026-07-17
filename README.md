@@ -36,9 +36,9 @@ auto_hack_3in1.exe
 
 ## Configuration
 
-Runtime settings are stored next to the executable in `setting.ini`. This file is intentionally ignored by Git because it is local machine/user state.
+Runtime settings are stored next to the executable in `setting.ini`. The program creates and updates this file automatically, so you do not need to prepare it before running the app.
 
-To start from the default values, copy or recreate the values from `setting.example.ini`:
+`setting.ini` is intentionally ignored by Git because it is local machine/user state. `setting.example.ini` documents the default values:
 
 ```ini
 hotkey_vk=119
