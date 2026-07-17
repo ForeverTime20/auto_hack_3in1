@@ -1,0 +1,23 @@
+# Build outputs
+*.exe
+*.dll
+*.obj
+*.o
+*.pdb
+*.ilk
+*.lib
+*.a
+build/
+dist/
+
+# Local runtime files
+setting.ini
+debug.log
+
+# Editor and OS noise
+.vs/
+.vscode/
+*.user
+*.suo
+Thumbs.db
+Desktop.ini
