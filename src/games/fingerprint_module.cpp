@@ -526,48 +526,39 @@ static RoiInfo detectMinigame(const Frame& f, std::string* diag = nullptr) {
     int bestScore = -1000000000;
     TitleBars bestBars;
     Rect bestPanel{};
-    for (const auto& timer : bars) {
-        if (!(timer.cx < f.w * 0.50 && timer.rect.w > f.w * 0.16 && timer.rect.w < f.w * 0.38)) continue;
-        if (!(timer.cy > f.h * 0.05 && timer.cy < f.h * 0.20)) continue;
+    for (const auto& target : bars) {
+        if (!(target.cx > f.w * 0.40 && target.rect.w > f.w * 0.24 && target.rect.w < f.w * 0.55)) continue;
+        if (!(target.cy > f.h * 0.05 && target.cy < f.h * 0.20)) continue;
 
-        for (const auto& target : bars) {
-            if (&target == &timer) continue;
-            if (!(target.cx > timer.cx + f.w * 0.20 && target.rect.w > f.w * 0.24 && target.rect.w < f.w * 0.55)) continue;
-            if (!closeEnough(target.cy, timer.cy, f.h * 0.045)) continue;
+        for (const auto& components : bars) {
+            if (&components == &target) continue;
+            if (!(components.cx < target.cx - f.w * 0.20 && components.rect.w > f.w * 0.16 && components.rect.w < f.w * 0.38)) continue;
+            if (!(components.cy > target.cy + f.h * 0.07 && components.cy < target.cy + f.h * 0.23)) continue;
 
-            for (const auto& components : bars) {
-                if (&components == &timer || &components == &target) continue;
-                if (!(components.cy > timer.cy + f.h * 0.07 && components.cy < timer.cy + f.h * 0.23)) continue;
-                if (!closeEnough(components.cx, timer.cx, f.w * 0.09)) continue;
-                if (!closeEnough(components.rect.w, timer.rect.w, f.w * 0.11)) continue;
+            for (const auto& signals : bars) {
+                if (&signals == &target || &signals == &components) continue;
+                if (!(signals.cy > components.cy + f.h * 0.35 && signals.cy < f.h * 0.84)) continue;
+                if (!closeEnough(signals.cx, target.cx, f.w * 0.12)) continue;
+                if (!closeEnough(signals.rect.w, target.rect.w, f.w * 0.16)) continue;
 
-                for (const auto& signals : bars) {
-                    if (&signals == &timer || &signals == &target || &signals == &components) continue;
-                    if (!(signals.cy > components.cy + f.h * 0.35 && signals.cy < f.h * 0.84)) continue;
-                    if (!closeEnough(signals.cx, target.cx, f.w * 0.12)) continue;
-                    if (!closeEnough(signals.rect.w, target.rect.w, f.w * 0.16)) continue;
+                int left = components.rect.x - scaledPx(f, 36);
+                int top = target.rect.y - scaledPx(f, 14);
+                int panelRight = std::max(right(target.rect), right(signals.rect)) + scaledPx(f, 36);
+                int panelBottom = bottom(signals.rect) + scaledPx(f, 170);
+                Rect panel = clampRect({left, top, panelRight - left, panelBottom - top}, f.w, f.h);
+                double panelAsp = panel.w / (double)std::max(1, panel.h);
+                if (!(panel.w > f.w * 0.45 && panel.h > f.h * 0.45 && panelAsp > 1.0 && panelAsp < 2.0)) continue;
 
-                    int left = std::min(timer.rect.x, components.rect.x) - scaledPx(f, 36);
-                    int top = std::min(timer.rect.y, target.rect.y) - scaledPx(f, 14);
-                    int panelRight = std::max(right(target.rect), right(signals.rect)) + scaledPx(f, 36);
-                    int panelBottom = bottom(signals.rect) + scaledPx(f, 170);
-                    Rect panel = clampRect({left, top, panelRight - left, panelBottom - top}, f.w, f.h);
-                    double panelAsp = panel.w / (double)std::max(1, panel.h);
-                    if (!(panel.w > f.w * 0.45 && panel.h > f.h * 0.45 && panelAsp > 1.0 && panelAsp < 2.0)) continue;
-
-                    int score = timer.pixels + target.pixels + components.pixels + signals.pixels;
-                    score -= (int)std::lround(std::abs(timer.cy - target.cy) * 20.0);
-                    score -= (int)std::lround(std::abs(components.cx - timer.cx) * 3.0);
-                    score -= (int)std::lround(std::abs(signals.cx - target.cx) * 2.0);
-                    if (score > bestScore) {
-                        bestScore = score;
-                        bestBars.timer = timer.rect;
-                        bestBars.target = target.rect;
-                        bestBars.components = components.rect;
-                        bestBars.signals = signals.rect;
-                        bestBars.hasTimer = bestBars.hasTarget = bestBars.hasComponents = bestBars.hasSignals = true;
-                        bestPanel = panel;
-                    }
+                int score = target.pixels + components.pixels + signals.pixels;
+                score -= (int)std::lround(std::abs(signals.cx - target.cx) * 2.0);
+                score -= (int)std::lround(std::abs((target.cx - components.cx) - f.w * 0.31) * 1.5);
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestBars.target = target.rect;
+                    bestBars.components = components.rect;
+                    bestBars.signals = signals.rect;
+                    bestBars.hasTarget = bestBars.hasComponents = bestBars.hasSignals = true;
+                    bestPanel = panel;
                 }
             }
         }
@@ -583,7 +574,7 @@ static RoiInfo detectMinigame(const Frame& f, std::string* diag = nullptr) {
         return info;
     };
 
-    info.isMinigame = info.bars.hasTimer && info.bars.hasTarget && info.bars.hasComponents && info.bars.hasSignals;
+    info.isMinigame = info.bars.hasTarget && info.bars.hasComponents && info.bars.hasSignals;
     if (diag) {
         char buf[256];
         std::snprintf(

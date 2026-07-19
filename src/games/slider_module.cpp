@@ -31,10 +31,13 @@ constexpr double kMinUsableVelocityPxPerSec = 25.0;
 constexpr double kLateGraceSeconds = 0.010;
 constexpr double kInvalidPredictionSeconds = 999.0;
 constexpr int kHudWidth = 300;
+constexpr int kHudMiniWidth = 236;
+constexpr int kHudMiniHeight = 42;
 constexpr int kHudCollapsedHeight = 118;
 constexpr int kHudExpandedHeight = 260;
 constexpr int kHudMargin = 18;
 constexpr int kHudTopMargin = 118;
+constexpr ULONGLONG kHudAutoCollapseMs = 3500;
 constexpr int kCursorSize = 64;
 constexpr int kCursorArrowTopOffset = 14;
 constexpr int kCursorArrowBottomOffset = 14;
@@ -175,6 +178,7 @@ std::atomic<int> g_pendingHotkeyVk{VK_F6};
 std::atomic<int> g_tapHoldMs{8};
 std::atomic<int> g_tapGapMs{18};
 std::atomic<bool> g_listeningHotkey{false};
+std::atomic<bool> g_panelExpanded{false};
 std::atomic<bool> g_settingsExpanded{false};
 std::atomic<bool> g_overlayCursorEnabled{true};
 std::atomic<bool> g_cursorVisible{false};
@@ -187,9 +191,15 @@ bool g_hudUserPlaced = false;
 POINT g_hudPos{0, 0};
 bool g_hudDragging = false;
 POINT g_hudDragOffset{0, 0};
+ULONGLONG g_lastHudInteractionTick = 0;
 
 int CurrentHudHeight() {
+  if (!g_panelExpanded.load(std::memory_order_relaxed)) return kHudMiniHeight;
   return g_settingsExpanded.load(std::memory_order_relaxed) ? kHudExpandedHeight : kHudCollapsedHeight;
+}
+
+int CurrentHudWidth() {
+  return g_panelExpanded.load(std::memory_order_relaxed) ? kHudWidth : kHudMiniWidth;
 }
 
 RECT MonitorRectFromHandle(HMONITOR monitor) {
@@ -406,7 +416,7 @@ RECT ClampHudScreenRect(RECT panel) {
 RECT HudPanelRect(const PreviewState& state, const RECT& client) {
   (void)state;
   (void)client;
-  return RECT{0, 0, kHudWidth, CurrentHudHeight()};
+  return RECT{0, 0, CurrentHudWidth(), CurrentHudHeight()};
 }
 
 RECT InitialHudScreenRect() {
@@ -414,7 +424,7 @@ RECT InitialHudScreenRect() {
   const int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
 
   if (g_hudUserPlaced) {
-    return ClampHudScreenRect(RECT{g_hudPos.x, g_hudPos.y, g_hudPos.x + kHudWidth, g_hudPos.y + CurrentHudHeight()});
+    return ClampHudScreenRect(RECT{g_hudPos.x, g_hudPos.y, g_hudPos.x + CurrentHudWidth(), g_hudPos.y + CurrentHudHeight()});
   }
 
   constexpr int kHudTopDrop = 50;
@@ -423,9 +433,9 @@ RECT InitialHudScreenRect() {
   if (vw == 5760) {
     const int middleRight = vx + 1920 * 2;
     const int topBase = GetSystemMetrics(SM_YVIRTUALSCREEN);
-    const int left = middleRight - kHudWidth - kHudMargin - kHudRightExtraInset;
+    const int left = middleRight - CurrentHudWidth() - kHudMargin - kHudRightExtraInset;
     const int top = topBase + kHudTopDrop;
-    return ClampHudScreenRect(RECT{left, top, left + kHudWidth, top + CurrentHudHeight()});
+    return ClampHudScreenRect(RECT{left, top, left + CurrentHudWidth(), top + CurrentHudHeight()});
   }
 
   RECT gtaRect{};
@@ -446,12 +456,12 @@ RECT InitialHudScreenRect() {
   }
 
   RECT mr = MonitorRectFromHandle(monitor);
-  const int left = mr.right - kHudWidth - kHudMargin - kHudRightExtraInset;
+  const int left = mr.right - CurrentHudWidth() - kHudMargin - kHudRightExtraInset;
   const int top = mr.top + kHudTopDrop;
   RECT panel{
       left,
       top,
-      left + kHudWidth,
+      left + CurrentHudWidth(),
       top + CurrentHudHeight(),
   };
 
@@ -460,6 +470,10 @@ RECT InitialHudScreenRect() {
 
 RECT HudExitButtonRect(const RECT& panel) {
   return RECT{panel.right - 36, panel.top + 10, panel.right - 14, panel.top + 32};
+}
+
+RECT HudCollapseButtonRect(const RECT& panel) {
+  return RECT{panel.right - 66, panel.top + 10, panel.right - 44, panel.top + 32};
 }
 
 RECT HudHeaderRect(const RECT& panel) {
@@ -504,6 +518,38 @@ RECT HudTapGapValueRect(const RECT& panel) {
 
 RECT HudTapGapPlusRect(const RECT& panel) {
   return RECT{panel.left + 230, panel.top + 220, panel.left + 252, panel.top + 244};
+}
+
+void ResizeHudToCurrent(HWND hwnd) {
+  if (!hwnd) return;
+  RECT wr{};
+  GetWindowRect(hwnd, &wr);
+  RECT desired{wr.left, wr.top, wr.left + CurrentHudWidth(), wr.top + CurrentHudHeight()};
+  RECT clamped = ClampHudScreenRect(desired);
+  g_hudPos = POINT{clamped.left, clamped.top};
+  g_hudUserPlaced = true;
+  SetWindowPos(hwnd, HWND_TOPMOST, clamped.left, clamped.top, CurrentHudWidth(), CurrentHudHeight(),
+               SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+}
+
+void TouchHudInteraction() {
+  g_lastHudInteractionTick = GetTickCount64();
+}
+
+void CollapseHudPanel(HWND hwnd) {
+  g_panelExpanded.store(false, std::memory_order_relaxed);
+  g_settingsExpanded.store(false, std::memory_order_relaxed);
+  g_listeningHotkey.store(false, std::memory_order_relaxed);
+  ResizeHudToCurrent(hwnd);
+  if (hwnd) InvalidateRect(hwnd, nullptr, FALSE);
+}
+
+void ExpandHudPanel(HWND hwnd) {
+  g_panelExpanded.store(true, std::memory_order_relaxed);
+  g_listeningHotkey.store(false, std::memory_order_relaxed);
+  TouchHudInteraction();
+  ResizeHudToCurrent(hwnd);
+  if (hwnd) InvalidateRect(hwnd, nullptr, FALSE);
 }
 
 PreviewState SnapshotPreviewState() {
@@ -1565,6 +1611,18 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             }
           }
         }
+        if (g_panelExpanded.load(std::memory_order_relaxed) &&
+            !g_hudDragging &&
+            !g_listeningHotkey.load(std::memory_order_relaxed) &&
+            g_lastHudInteractionTick != 0 &&
+            GetTickCount64() - g_lastHudInteractionTick >= kHudAutoCollapseMs) {
+          RECT wr{};
+          POINT cursor{};
+          if (GetWindowRect(hwnd, &wr) && GetCursorPos(&cursor) && !PtInRect(&wr, cursor)) {
+            CollapseHudPanel(hwnd);
+            return 0;
+          }
+        }
         RequestOverlayRepaint();
         return 0;
       }
@@ -1574,7 +1632,13 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
       GetClientRect(hwnd, &rc);
       PreviewState state = SnapshotPreviewState();
       RECT panel = HudPanelRect(state, rc);
+      if (!g_panelExpanded.load(std::memory_order_relaxed)) {
+        POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        ScreenToClient(hwnd, &pt);
+        return PtInRect(&panel, pt) ? HTCLIENT : HTTRANSPARENT;
+      }
       RECT exitButton = HudExitButtonRect(panel);
+      RECT collapseButton = HudCollapseButtonRect(panel);
       RECT header = HudHeaderRect(panel);
       RECT settingsToggle = HudSettingsToggleRect(panel);
       RECT hotkeyBox = HudHotkeyRect(panel);
@@ -1587,7 +1651,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
       POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
       ScreenToClient(hwnd, &pt);
       const bool expanded = g_settingsExpanded.load(std::memory_order_relaxed);
-      return (PtInRect(&exitButton, pt) || PtInRect(&header, pt) || PtInRect(&settingsToggle, pt) ||
+      return (PtInRect(&exitButton, pt) || PtInRect(&collapseButton, pt) || PtInRect(&header, pt) || PtInRect(&settingsToggle, pt) ||
               (expanded && (PtInRect(&confirmBox, pt) || PtInRect(&overlayBox, pt) ||
                             PtInRect(&holdMinus, pt) || PtInRect(&holdPlus, pt) ||
                             PtInRect(&gapMinus, pt) || PtInRect(&gapPlus, pt))))
@@ -1599,7 +1663,13 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
       GetClientRect(hwnd, &rc);
       PreviewState state = SnapshotPreviewState();
       RECT panel = HudPanelRect(state, rc);
+      if (!g_panelExpanded.load(std::memory_order_relaxed)) {
+        ExpandHudPanel(hwnd);
+        return 0;
+      }
+      TouchHudInteraction();
       RECT exitButton = HudExitButtonRect(panel);
+      RECT collapseButton = HudCollapseButtonRect(panel);
       RECT header = HudHeaderRect(panel);
       RECT settingsToggle = HudSettingsToggleRect(panel);
       RECT hotkeyBox = HudHotkeyRect(panel);
@@ -1610,18 +1680,15 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
       RECT gapMinus = HudTapGapMinusRect(panel);
       RECT gapPlus = HudTapGapPlusRect(panel);
       POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+      if (PtInRect(&collapseButton, pt)) {
+        CollapseHudPanel(hwnd);
+        return 0;
+      }
       if (PtInRect(&settingsToggle, pt)) {
         const bool expanded = !g_settingsExpanded.load(std::memory_order_relaxed);
         g_settingsExpanded.store(expanded, std::memory_order_relaxed);
         g_listeningHotkey.store(false, std::memory_order_relaxed);
-        RECT wr{};
-        GetWindowRect(hwnd, &wr);
-        RECT desired{wr.left, wr.top, wr.left + kHudWidth, wr.top + CurrentHudHeight()};
-        RECT clamped = ClampHudScreenRect(desired);
-        g_hudPos = POINT{clamped.left, clamped.top};
-        g_hudUserPlaced = true;
-        SetWindowPos(hwnd, HWND_TOPMOST, clamped.left, clamped.top, kHudWidth, CurrentHudHeight(),
-                     SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+        ResizeHudToCurrent(hwnd);
         RequestOverlayRepaint();
         return 0;
       }
@@ -1673,15 +1740,16 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
       return 0;
     }
     case WM_MOUSEMOVE: {
+      if (g_panelExpanded.load(std::memory_order_relaxed)) TouchHudInteraction();
       if (g_hudDragging) {
         POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
         ClientToScreen(hwnd, &pt);
         RECT desired{pt.x - g_hudDragOffset.x, pt.y - g_hudDragOffset.y,
-                     pt.x - g_hudDragOffset.x + kHudWidth, pt.y - g_hudDragOffset.y + CurrentHudHeight()};
+                     pt.x - g_hudDragOffset.x + CurrentHudWidth(), pt.y - g_hudDragOffset.y + CurrentHudHeight()};
         RECT clamped = ClampHudScreenRect(desired);
         g_hudUserPlaced = true;
         g_hudPos = POINT{clamped.left, clamped.top};
-        SetWindowPos(hwnd, HWND_TOPMOST, clamped.left, clamped.top, kHudWidth, CurrentHudHeight(),
+        SetWindowPos(hwnd, HWND_TOPMOST, clamped.left, clamped.top, CurrentHudWidth(), CurrentHudHeight(),
                      SWP_NOACTIVATE | SWP_NOOWNERZORDER);
         return 0;
       }
@@ -1697,6 +1765,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
       GetClientRect(hwnd, &rc);
       PreviewState state = SnapshotPreviewState();
       RECT panel = HudPanelRect(state, rc);
+      if (!g_panelExpanded.load(std::memory_order_relaxed)) return 0;
       RECT exitButton = HudExitButtonRect(panel);
       POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
       if (PtInRect(&exitButton, pt)) {
@@ -1726,6 +1795,9 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
       HBRUSH runningBrush = CreateSolidBrush(RGB(255, 150, 45));
       HBRUSH readyBrush = CreateSolidBrush(RGB(80, 255, 140));
       HBRUSH dimPillBrush = CreateSolidBrush(RGB(30, 42, 54));
+      HPEN closePen = CreatePen(PS_SOLID, 2, RGB(255, 120, 120));
+      HBRUSH closeBrush = CreateSolidBrush(RGB(42, 20, 26));
+      HBRUSH confirmBrush = CreateSolidBrush(RGB(22, 48, 44));
       HGDIOBJ oldPen = SelectObject(hdc, redPen);
       HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(HOLLOW_BRUSH));
 
@@ -1737,7 +1809,27 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
       RECT panel = HudPanelRect(state, rc);
       const int px = panel.left;
       const int py = panel.top;
+      const bool isRunning = g_running.load(std::memory_order_relaxed);
+      if (!g_panelExpanded.load(std::memory_order_relaxed)) {
+        SelectObject(hdc, panelBrush);
+        SelectObject(hdc, redPen);
+        RoundRect(hdc, panel.left, panel.top, panel.right, panel.bottom, 18, 18);
+
+        RECT led{px + 14, py + 15, px + 26, py + 27};
+        SelectObject(hdc, isRunning ? runningBrush : readyBrush);
+        SelectObject(hdc, GetStockObject(NULL_PEN));
+        Ellipse(hdc, led.left, led.top, led.right, led.bottom);
+
+        const wchar_t* stateTitle = isRunning ? L"RUNNING" : L"READY";
+        SetTextColor(hdc, isRunning ? RGB(255, 170, 70) : RGB(145, 255, 175));
+        TextOutW(hdc, px + 36, py + 7, stateTitle, static_cast<int>(wcslen(stateTitle)));
+
+        std::wstring status = state.status.empty() ? L"idle" : state.status;
+        SetTextColor(hdc, RGB(210, 220, 230));
+        TextOutW(hdc, px + 104, py + 8, status.c_str(), static_cast<int>(std::min<size_t>(status.size(), 14)));
+      } else {
       RECT exitButton = HudExitButtonRect(panel);
+      RECT collapseButton = HudCollapseButtonRect(panel);
       RECT hotkeyBox = HudHotkeyRect(panel);
       RECT confirmBox = HudConfirmRect(panel);
       RECT overlayBox = HudOverlayCheckRect(panel);
@@ -1756,20 +1848,22 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
       RoundRect(hdc, panel.left, panel.top, panel.right, panel.bottom, 14, 14);
 
       RECT led{px + 14, py + 13, px + 26, py + 25};
-      const bool isRunning = g_running.load(std::memory_order_relaxed);
       SelectObject(hdc, isRunning ? runningBrush : readyBrush);
       Ellipse(hdc, led.left, led.top, led.right, led.bottom);
 
       const wchar_t* stateTitle = isRunning ? L"RUNNING" : L"READY";
       SetTextColor(hdc, isRunning ? RGB(255, 170, 70) : RGB(145, 255, 175));
       TextOutW(hdc, px + 36, py + 7, stateTitle, static_cast<int>(wcslen(stateTitle)));
-      const std::wstring prompt = isRunning ? (L"Press " + KeyName(g_hotkeyVk.load(std::memory_order_relaxed)) + L" to stop")
-                                            : (L"Press " + KeyName(g_hotkeyVk.load(std::memory_order_relaxed)) + L" to start");
+      const std::wstring prompt = L"Hotkey " + KeyName(g_hotkeyVk.load(std::memory_order_relaxed));
       SetTextColor(hdc, RGB(210, 220, 230));
-      TextOutW(hdc, px + 118, py + 8, prompt.c_str(), static_cast<int>(std::min<size_t>(prompt.size(), 19)));
+      TextOutW(hdc, px + 122, py + 8, prompt.c_str(), static_cast<int>(std::min<size_t>(prompt.size(), 12)));
 
-      HPEN closePen = CreatePen(PS_SOLID, 2, RGB(255, 120, 120));
-      HBRUSH closeBrush = CreateSolidBrush(RGB(42, 20, 26));
+      SelectObject(hdc, dimPillBrush);
+      SelectObject(hdc, redPen);
+      RoundRect(hdc, collapseButton.left, collapseButton.top, collapseButton.right, collapseButton.bottom, 8, 8);
+      MoveToEx(hdc, collapseButton.left + 6, collapseButton.top + 11, nullptr);
+      LineTo(hdc, collapseButton.right - 6, collapseButton.top + 11);
+
       SelectObject(hdc, closeBrush);
       SelectObject(hdc, closePen);
       RoundRect(hdc, exitButton.left, exitButton.top, exitButton.right, exitButton.bottom, 8, 8);
@@ -1800,7 +1894,6 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
       SelectObject(hdc, GetStockObject(NULL_PEN));
       Polygon(hdc, tri, 3);
 
-      HBRUSH confirmBrush = CreateSolidBrush(RGB(22, 48, 44));
       if (settingsExpanded) {
         SetTextColor(hdc, RGB(180, 195, 210));
         TextOutW(hdc, px + 14, py + 118, L"Hotkey", 6);
@@ -1862,6 +1955,7 @@ LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         drawTimingButton(gapPlus, L"+");
         SetTextColor(hdc, RGB(180, 195, 210));
         TextOutW(hdc, px + 260, py + 225, L"ms", 2);
+      }
       }
 
       SelectObject(hdc, oldFont);
@@ -2208,7 +2302,24 @@ void LoadPersistentSettings() { LoadSettings(); }
 void ApplyHotkey(HWND hwnd) { ApplyHotkeySetting(hwnd); }
 bool Running() { return g_running.load(std::memory_order_relaxed); }
 void RequestStop() { g_stopWorker.store(true, std::memory_order_relaxed); }
-void MarkRunning(bool running) { g_running.store(running, std::memory_order_relaxed); }
+void MarkRunning(bool running) {
+  g_running.store(running, std::memory_order_relaxed);
+  if (running) {
+    g_panelExpanded.store(false, std::memory_order_relaxed);
+    g_settingsExpanded.store(false, std::memory_order_relaxed);
+    g_listeningHotkey.store(false, std::memory_order_relaxed);
+    if (g_overlayWnd) {
+      RECT wr{};
+      GetWindowRect(g_overlayWnd, &wr);
+      RECT desired{wr.left, wr.top, wr.left + CurrentHudWidth(), wr.top + CurrentHudHeight()};
+      RECT clamped = ClampHudScreenRect(desired);
+      g_hudPos = POINT{clamped.left, clamped.top};
+      g_hudUserPlaced = true;
+      SetWindowPos(g_overlayWnd, HWND_TOPMOST, clamped.left, clamped.top, CurrentHudWidth(), CurrentHudHeight(),
+                   SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+    }
+  }
+}
 void ResetStopFlag() { g_stopWorker.store(false, std::memory_order_relaxed); }
 bool StopRequested() { return g_stopWorker.load(std::memory_order_relaxed); }
 std::thread& WorkerThread() { return g_worker; }
@@ -2238,7 +2349,7 @@ void HideTransientOverlays() { ClearOverlayState(); }
 bool DetectInGame() { CaptureFrame frame; if (!CaptureScreenRegion(frame, nullptr)) return false; return AnalyzeFrame(frame).inMinigame; }
 void RunSession() { WorkerLoop(); ClearOverlayState(); }
 RECT InitialHudRect() { return InitialHudScreenRect(); }
-int HudWidth() { return kHudWidth; }
+int HudWidth() { return CurrentHudWidth(); }
 int HudHeight() { return CurrentHudHeight(); }
 int CursorSize() { return kCursorSize; }
 int HotkeyId() { return kHotkeyToggleId; }

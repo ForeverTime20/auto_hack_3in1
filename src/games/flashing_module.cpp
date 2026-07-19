@@ -30,10 +30,6 @@ static const UINT TIMER_ID = 1001;
 static const UINT TIMER_MS = 16;
 static const int kMinigameCheckIntervalFrames = 10;
 static const int kSelectedStableFramesBeforeInput = 2;
-static const int kSuccessHitFramesBeforeLevelComplete = 3;
-static const DWORD64 kSuccessHitWindowMs = 450;
-static const DWORD64 kSuccessGoneMsBeforeNextLevel = 180;
-static const DWORD64 kFinalSubmitEmptyCheckDelayMs = 900;
 struct Pattern {
     std::array<int, GRID_CELLS> on{};
 
@@ -81,6 +77,19 @@ struct Circle {
     int y = 0;
     int r = 0;
     int score = 0;
+};
+
+struct UiRect {
+    int left = 0;
+    int top = 0;
+    int right = 0;
+    int bottom = 0;
+};
+
+struct HLine {
+    int x1 = 0;
+    int y = 0;
+    int x2 = 0;
 };
 
 static int CaptureHeightForScreen(int screenH) {
@@ -136,12 +145,16 @@ struct AppState {
     int selectedScore = 0;
     int lastSelectedIndex = -1;
     int selectedStableFrames = 0;
+    int levelSlot = 0;
+    int observedLevelSlot = 0;
+    int observedLevelStableFrames = 0;
+    bool levelFocusVisible = false;
+    UiRect levelFocus{};
     DWORD64 nextInputAt = 0;
     bool autoInputEnabled = false;
     int pendingVerifyCol = -1;
     DWORD64 finalSubmitAt = 0;
     bool minigameVisible = false;
-    bool successVisible = false;
     std::wstring autoMessage = L"Auto idle";
 
     Pattern current{};
@@ -216,6 +229,12 @@ static bool CaptureScreen(ScreenShot& shot) {
 
 static bool IsWhiteUiPixel(uint8_t r, uint8_t gch, uint8_t b) {
     return r > 175 && gch > 175 && b > 175 && std::abs(r - gch) < 55 && std::abs(r - b) < 55;
+}
+
+static bool IsLevelLinePixel(uint8_t r, uint8_t gch, uint8_t b) {
+    int gray = (static_cast<int>(r) * 30 + static_cast<int>(gch) * 59 + static_cast<int>(b) * 11) / 100;
+    bool cyan = gch > 120 && b > 120 && r < 110 && (gch - r) > 25 && (b - r) > 25;
+    return gray >= 140 && !cyan;
 }
 
 static bool IsBluePixel(uint8_t r, uint8_t gch, uint8_t b);
@@ -607,7 +626,7 @@ static bool AnalyzeMinigamePage(const ScreenShot& shot, WhiteBar* signalOut = nu
         }
     }
 
-    if (!hasRightTitle || topTitleCount < 2) return false;
+    if (!hasRightTitle || topTitleCount < 1) return false;
     if (signalOut) *signalOut = signal;
     return true;
 }
@@ -618,177 +637,265 @@ static bool IsMinigamePageVisible() {
     return AnalyzeMinigamePage(shot, nullptr);
 }
 
-static bool IsSuccessPopupVisible() {
-    if (!g.circlesReady || g.roiW <= 0 || g.roiH <= 0) return false;
+static bool FindDecodedDigitsBar(const ScreenShot& shot, const std::vector<WhiteBar>& bars,
+                                 const WhiteBar& signal, WhiteBar& decoded) {
+    int titleYSlack = ScalePx(35, shot.h);
+    int signalCenterY = signal.y + signal.h / 2;
+    int bestRank = -1000000;
 
-    ScreenShot shot;
-    if (!CaptureScreen(shot)) return false;
+    for (const WhiteBar& b : bars) {
+        int centerX = b.x + b.w / 2;
+        int centerY = b.y + b.h / 2;
+        if (std::abs(centerY - signalCenterY) > titleYSlack) continue;
+        if (b.x <= signal.x + signal.w * 3 / 4) continue;
+        if (b.w < signal.w * 25 / 100 || b.w > signal.w * 70 / 100) continue;
+        if (b.score < 28) continue;
 
-    int searchXScreen = g.roiX - static_cast<int>(std::lround(g.roiW * 0.09));
-    int searchYScreen = g.roiY - static_cast<int>(std::lround(g.roiH * 0.08));
-    int searchSizeScreen = static_cast<int>(std::lround(g.roiW * 1.26));
-    int searchX = ToShotX(shot, searchXScreen);
-    int searchY = ToShotY(shot, searchYScreen);
-    int searchSize = std::max(1, ToShotX(shot, searchSizeScreen));
-
-    // Use only native popup geometry. The user overlay can draw colored marks
-    // near this panel, so the detector ignores color cues and requires both
-    // the popup body and its left check-box icon to match.
-    int panelX = searchX - static_cast<int>(std::lround(searchSize * 0.02));
-    int panelY = searchY - static_cast<int>(std::lround(searchSize * 0.08));
-    int panelW = static_cast<int>(std::lround(searchSize * 1.34));
-    int panelH = static_cast<int>(std::lround(searchSize * 0.95));
-
-    struct Stats {
-        int samples = 0;
-        int bright = 0;
-        int dark = 0;
-        int cyan = 0;
-    };
-    auto isCyan = [](int r, int gch, int b) {
-        return gch > 120 && b > 120 && r < 110 && (gch - r) > 25 && (b - r) > 25;
-    };
-    auto sampleRect = [&](int left, int top, int right, int bottom, int step) {
-        left = std::max(0, std::min(left, shot.w - 1));
-        top = std::max(0, std::min(top, shot.h - 1));
-        right = std::max(left, std::min(right, shot.w - 1));
-        bottom = std::max(top, std::min(bottom, shot.h - 1));
-
-        Stats s;
-        step = std::max(1, step);
-        for (int y = top; y <= bottom; y += step) {
-            const uint8_t* row = shot.pixels.data() + static_cast<size_t>(y) * shot.w * 4;
-            for (int x = left; x <= right; x += step) {
-                const uint8_t* p = row + x * 4;
-                int gray = GrayAt(p);
-                if (gray >= 175) ++s.bright;
-                if (gray <= 35) ++s.dark;
-                if (isCyan(p[2], p[1], p[0])) ++s.cyan;
-                ++s.samples;
-            }
+        int rank = b.w * 4 - std::abs(centerY - signalCenterY) * 16 + centerX / 8;
+        if (rank > bestRank) {
+            bestRank = rank;
+            decoded = b;
         }
-        return s;
-    };
-    auto pct = [](int count, int samples) {
-        return samples > 0 ? count * 100.0 / samples : 0.0;
-    };
+    }
 
-    int panelLeft = std::max(0, std::min(panelX, shot.w - 1));
-    int panelTop = std::max(0, std::min(panelY, shot.h - 1));
-    int panelRight = std::max(panelLeft, std::min(panelX + panelW, shot.w - 1));
-    int panelBottom = std::max(panelTop, std::min(panelY + panelH, shot.h - 1));
-    int regionW = panelRight - panelLeft + 1;
-    int regionH = panelBottom - panelTop + 1;
-    if (regionW < 80 || regionH < 80) return false;
+    return bestRank != -1000000;
+}
 
-    auto markPixel = [&](int x, int y, bool brightMark) {
-        const uint8_t* p = PixelAt(shot, x, y);
-        if (!p) return false;
-        int gray = GrayAt(p);
-        if (brightMark) {
-            return gray >= 160 && !isCyan(p[2], p[1], p[0]);
-        }
-        return gray <= 70;
-    };
-    auto verifySquare = [&](bool brightMark,
-                          int area,
-                          int minX,
-                          int minY,
-                          int maxX,
-                          int maxY) {
-        int bboxW = maxX - minX + 1;
-        int bboxH = maxY - minY + 1;
-        double side = std::max(bboxW, bboxH);
-        double aspect = bboxW / static_cast<double>(std::max(1, bboxH));
-        if (aspect < 0.72 || aspect > 1.32) return false;
-        if (side < panelW * 0.035 || side > panelW * 0.100) return false;
-        if (side < panelH * 0.035 || side > panelH * 0.110) return false;
+static std::vector<HLine> FindHorizontalRuns(const ScreenShot& shot, const UiRect& region,
+                                             int minLen, int maxLen, int maxGap) {
+    std::vector<HLine> lines;
+    int left = std::max(0, std::min(region.left, shot.w - 1));
+    int top = std::max(0, std::min(region.top, shot.h - 1));
+    int right = std::max(left, std::min(region.right, shot.w - 1));
+    int bottom = std::max(top, std::min(region.bottom, shot.h - 1));
+    maxGap = std::max(1, maxGap);
 
-        double density = area * 100.0 / std::max(1, bboxW * bboxH);
-        if (density < 55.0 || density > 98.0) return false;
-
-        int pad = std::max(1, static_cast<int>(std::lround(side * 0.06)));
-        int squareLeft = minX - pad;
-        int squareTop = minY - pad;
-        int squareRight = maxX + pad;
-        int squareBottom = maxY + pad;
-        if (squareLeft < panelLeft || squareTop < panelTop || squareRight > panelRight || squareBottom > panelBottom) {
-            return false;
-        }
-
-        Stats square = sampleRect(squareLeft, squareTop, squareRight, squareBottom, 1);
-        double squareBright = pct(square.bright, square.samples);
-        double squareDark = pct(square.dark, square.samples);
-        double squareCyan = pct(square.cyan, square.samples);
-        bool squareOk = brightMark
-            ? (squareBright >= 58.0 && squareDark >= 2.0 && squareDark <= 38.0 && squareCyan <= 1.0)
-            : (squareDark >= 58.0 && squareBright >= 2.0 && squareBright <= 38.0 && squareCyan <= 1.0);
-        if (!squareOk) return false;
-
-        int popupLeft = static_cast<int>(std::lround(squareLeft - side * 2.20));
-        int popupTop = static_cast<int>(std::lround(squareTop - side * 0.85));
-        int popupRight = static_cast<int>(std::lround(squareLeft + side * 7.80));
-        int popupBottom = static_cast<int>(std::lround(squareTop + side * 2.05));
-        if (popupLeft < panelLeft || popupTop < panelTop || popupRight > panelRight || popupBottom > panelBottom) {
-            return false;
-        }
-
-        Stats popup = sampleRect(popupLeft, popupTop, popupRight, popupBottom,
-                                 std::max(1, static_cast<int>(std::lround(side / 28.0))));
-        double popupBright = pct(popup.bright, popup.samples);
-        double popupDark = pct(popup.dark, popup.samples);
-        double popupCyan = pct(popup.cyan, popup.samples);
-        return brightMark
-            ? (popupDark >= 40.0 && popupBright >= 3.0 && popupCyan <= 1.5)
-            : (popupBright >= 35.0 && popupDark >= 5.0 && popupCyan <= 1.5);
-    };
-    auto findContrastSquare = [&](bool brightMark) {
-        std::vector<uint8_t> seen(static_cast<size_t>(regionW) * regionH, 0);
-        std::vector<int> stack;
-        for (int ry = 0; ry < regionH; ++ry) {
-            for (int rx = 0; rx < regionW; ++rx) {
-                int start = ry * regionW + rx;
-                if (seen[start]) continue;
-                int absX = panelLeft + rx;
-                int absY = panelTop + ry;
-                if (!markPixel(absX, absY, brightMark)) continue;
-
-                int area = 0, minX = absX, minY = absY, maxX = absX, maxY = absY;
-                stack.clear();
-                stack.push_back(start);
-                seen[start] = 1;
-                while (!stack.empty()) {
-                    int pos = stack.back();
-                    stack.pop_back();
-                    int px = pos % regionW;
-                    int py = pos / regionW;
-                    int x = panelLeft + px;
-                    int y = panelTop + py;
-                    ++area;
-                    minX = std::min(minX, x);
-                    minY = std::min(minY, y);
-                    maxX = std::max(maxX, x);
-                    maxY = std::max(maxY, y);
-
-                    const int offsets[4][2] = { {-1, 0}, {1, 0}, {0, -1}, {0, 1} };
-                    for (int i = 0; i < 4; ++i) {
-                        int nx = px + offsets[i][0];
-                        int ny = py + offsets[i][1];
-                        if (nx < 0 || ny < 0 || nx >= regionW || ny >= regionH) continue;
-                        int next = ny * regionW + nx;
-                        if (!seen[next] && markPixel(panelLeft + nx, panelTop + ny, brightMark)) {
-                            seen[next] = 1;
-                            stack.push_back(next);
-                        }
-                    }
+    for (int y = top; y <= bottom; ++y) {
+        bool inRun = false;
+        int runStart = left;
+        int lastWhite = left;
+        int gap = 0;
+        for (int x = left; x <= right; ++x) {
+            const uint8_t* p = PixelAt(shot, x, y);
+            bool white = p && IsLevelLinePixel(p[2], p[1], p[0]);
+            if (white) {
+                if (!inRun) {
+                    inRun = true;
+                    runStart = x;
                 }
-                if (area >= 20 && verifySquare(brightMark, area, minX, minY, maxX, maxY)) return true;
+                lastWhite = x;
+                gap = 0;
+            } else if (inRun) {
+                ++gap;
+                if (gap > maxGap) {
+                    int len = lastWhite - runStart + 1;
+                    if (len >= minLen && len <= maxLen) {
+                        lines.push_back({ runStart, y, lastWhite });
+                    }
+                    inRun = false;
+                    gap = 0;
+                }
             }
         }
-        return false;
-    };
+        if (inRun) {
+            int len = lastWhite - runStart + 1;
+            if (len >= minLen && len <= maxLen) {
+                lines.push_back({ runStart, y, lastWhite });
+            }
+        }
+    }
+    return lines;
+}
 
-    return findContrastSquare(true) || findContrastSquare(false);
+static bool FindLevelBlock(const ScreenShot& shot, UiRect& block) {
+    const int scaleH = shot.h;
+    if (!g.circlesReady) return false;
+
+    std::vector<WhiteBar> bars = FindWhiteBars(shot);
+    WhiteBar signal{};
+    WhiteBar decoded{};
+    if (!FindSignalRepeaterBar(shot, bars, signal)) return false;
+    if (!FindDecodedDigitsBar(shot, bars, signal, decoded)) return false;
+
+    int top = shot.h;
+    int bottom = 0;
+    std::vector<int> centers;
+    std::vector<int> radii;
+    for (int row = 0; row < GRID_ROWS; ++row) {
+        const Circle& circle = g.circles[row * GRID_COLS + (GRID_COLS - 1)];
+        int cy = ToShotY(shot, circle.y);
+        int r = std::max(1, static_cast<int>(std::lround(circle.r / std::max(0.0001, shot.toScreenY))));
+        centers.push_back(cy);
+        radii.push_back(r);
+        top = std::min(top, cy - r);
+        bottom = std::max(bottom, cy + r);
+    }
+    std::sort(centers.begin(), centers.end());
+    std::sort(radii.begin(), radii.end());
+    int radius = radii[radii.size() / 2];
+    int rowGap = centers.size() >= 2 ? centers[1] - centers[0] : radius * 2;
+    for (size_t i = 2; i < centers.size(); ++i) {
+        rowGap = std::min(rowGap, centers[i] - centers[i - 1]);
+    }
+
+    UiRect search{
+        std::max(0, decoded.x - ScalePx(8, scaleH)),
+        std::max(0, top),
+        std::min(shot.w - 1, decoded.x + decoded.w + ScalePx(8, scaleH)),
+        std::min(shot.h - 1, bottom + rowGap + radius * 2)
+    };
+    if (search.right <= search.left || search.bottom <= search.top) return false;
+
+    int minBlockW = std::max(ScalePx(240, scaleH), decoded.w * 70 / 100);
+    int maxBlockW = decoded.w + ScalePx(36, scaleH);
+    std::vector<HLine> lines = FindHorizontalRuns(
+        shot,
+        search,
+        minBlockW,
+        maxBlockW,
+        ScalePx(10, scaleH));
+
+    int bestScore = -1;
+    UiRect best{};
+    for (const HLine& top : lines) {
+        for (const HLine& bottom : lines) {
+            if (bottom.y <= top.y) continue;
+            int h = bottom.y - top.y;
+            if (h < ScalePx(90, scaleH) || h > ScalePx(150, scaleH)) continue;
+
+            int left = std::min(top.x1, bottom.x1);
+            int right = std::max(top.x2, bottom.x2);
+            int w = right - left + 1;
+            if (w < minBlockW || w > maxBlockW) continue;
+            if (std::abs(top.x1 - bottom.x1) > ScalePx(28, scaleH)) continue;
+            if (std::abs(top.x2 - bottom.x2) > ScalePx(28, scaleH)) continue;
+
+            int decodedCenterX = decoded.x + decoded.w / 2;
+            int score = w * h - std::abs((left + right) / 2 - decodedCenterX);
+            if (score > bestScore) {
+                bestScore = score;
+                best = { left, top.y, right, bottom.y };
+            }
+        }
+    }
+
+    if (bestScore < 0) return false;
+    block = best;
+    return true;
+}
+
+static bool FindLevelFocusFrame(const ScreenShot& shot, const UiRect& block, UiRect& focus) {
+    const int scaleH = shot.h;
+    UiRect inner{
+        block.left + ScalePx(8, scaleH),
+        block.top + ScalePx(8, scaleH),
+        block.right - ScalePx(8, scaleH),
+        block.bottom - ScalePx(18, scaleH)
+    };
+    std::vector<HLine> lines = FindHorizontalRuns(
+        shot,
+        inner,
+        ScalePx(54, scaleH),
+        ScalePx(90, scaleH),
+        ScalePx(6, scaleH));
+
+    int bestScore = -1;
+    UiRect best{};
+    for (const HLine& top : lines) {
+        for (const HLine& bottom : lines) {
+            if (bottom.y <= top.y) continue;
+            int h = bottom.y - top.y + 1;
+            if (h < ScalePx(50, scaleH) || h > ScalePx(86, scaleH)) continue;
+            int wTop = top.x2 - top.x1 + 1;
+            int wBottom = bottom.x2 - bottom.x1 + 1;
+            if (std::abs(top.x1 - bottom.x1) > ScalePx(12, scaleH)) continue;
+            if (std::abs(top.x2 - bottom.x2) > ScalePx(12, scaleH)) continue;
+
+            int left = std::min(top.x1, bottom.x1);
+            int right = std::max(top.x2, bottom.x2);
+            int w = right - left + 1;
+            if (std::abs(w - h) > ScalePx(18, scaleH)) continue;
+
+            int score = w * h + std::min(wTop, wBottom) * 8;
+            if (score > bestScore) {
+                bestScore = score;
+                best = { left, top.y, right, bottom.y };
+            }
+        }
+    }
+
+    if (bestScore < 0) return false;
+    focus = best;
+    return true;
+}
+
+static int DetectLevelSlotFromShot(const ScreenShot& shot, UiRect* focusScreen = nullptr) {
+    UiRect block{};
+    UiRect focus{};
+    if (!FindLevelBlock(shot, block)) return 0;
+    if (!FindLevelFocusFrame(shot, block, focus)) return 0;
+
+    if (focusScreen) {
+        *focusScreen = {
+            ToScreenX(shot, focus.left),
+            ToScreenY(shot, focus.top),
+            ToScreenX(shot, focus.right),
+            ToScreenY(shot, focus.bottom)
+        };
+    }
+
+    double blockW = std::max(1, block.right - block.left + 1);
+    double focusCenterX = (focus.left + focus.right) * 0.5;
+    double ratio = (focusCenterX - block.left) / blockW;
+    int slot = static_cast<int>(std::floor(ratio * 4.0)) + 1;
+    return std::max(1, std::min(4, slot));
+}
+
+static int DetectLevelSlot() {
+    ScreenShot shot;
+    if (!CaptureScreen(shot)) {
+        g.levelFocusVisible = false;
+        return 0;
+    }
+
+    UiRect focus{};
+    int slot = DetectLevelSlotFromShot(shot, &focus);
+    if (slot > 0) {
+        g.levelFocus = focus;
+        g.levelFocusVisible = true;
+    } else {
+        g.levelFocusVisible = false;
+    }
+    return slot;
+}
+
+static bool UpdateObservedLevelSlot(int detectedSlot, bool* changed = nullptr, bool initialIsChange = false) {
+    if (changed) *changed = false;
+    if (detectedSlot <= 0) {
+        g.observedLevelSlot = 0;
+        g.observedLevelStableFrames = 0;
+        return false;
+    }
+
+    if (detectedSlot == g.observedLevelSlot) {
+        ++g.observedLevelStableFrames;
+    } else {
+        g.observedLevelSlot = detectedSlot;
+        g.observedLevelStableFrames = 1;
+    }
+
+    if (g.observedLevelStableFrames < 2) return false;
+    if (g.levelSlot == 0) {
+        g.levelSlot = detectedSlot;
+        if (initialIsChange && changed) *changed = true;
+        return true;
+    }
+    if (detectedSlot != g.levelSlot) {
+        g.levelSlot = detectedSlot;
+        if (changed) *changed = true;
+        return true;
+    }
+    return true;
 }
 
 struct CaptureResult {
@@ -957,6 +1064,7 @@ static void UpdateStatus() {
        << L" | Detected flashes: " << g.detectedCount
        << L" | Repeat: " << g.tracker.repeatCount
        << L" | Target: " << (g.tracker.targetReady ? L"yes" : L"no")
+       << L" | Level: " << (g.levelSlot > 0 ? g.levelSlot : g.observedLevelSlot)
        << L" | Selected: ";
     if (g.selectedIndex >= 0) {
         ss << (g.selectedIndex + 1) << L" score " << g.selectedScore;
@@ -990,6 +1098,13 @@ static int TargetRowForColumn(const Pattern& pattern, int col) {
     return -1;
 }
 
+static int LastTargetColumn(const Pattern& pattern) {
+    for (int col = GRID_COLS - 1; col >= 0; --col) {
+        if (TargetRowForColumn(pattern, col) >= 0) return col;
+    }
+    return -1;
+}
+
 static bool WaitingColumnVerify() {
     return g.tracker.targetReady
         && g.pendingVerifyCol >= 0
@@ -998,16 +1113,6 @@ static bool WaitingColumnVerify() {
 
 static bool AwaitingFinalSubmitResult() {
     return g.tracker.targetReady && g.finalSubmitAt != 0;
-}
-
-static bool FinalSubmitEmptyCheckDue() {
-    return AwaitingFinalSubmitResult()
-        && GetTickCount64() - g.finalSubmitAt >= kFinalSubmitEmptyCheckDelayMs;
-}
-
-static bool UpdateFinalSubmitEmptyCheck(const CaptureResult& capture) {
-    if (!FinalSubmitEmptyCheckDue()) return false;
-    return !capture.pattern.any();
 }
 
 static void PressScanCode(WORD scanCode, bool extended = false) {
@@ -1094,15 +1199,20 @@ static void TickAutoInput() {
     int selectedRow = g.selectedIndex / GRID_COLS;
     int selectedCol = g.selectedIndex % GRID_COLS;
     if (selectedCol < 0 || selectedCol >= GRID_COLS) return;
+    int lastTargetCol = LastTargetColumn(g.tracker.target);
+    if (lastTargetCol < 0) {
+        g.autoMessage = L"Plan failed: empty target";
+        return;
+    }
 
     if (g.pendingVerifyCol >= 0) {
         int pendingCol = g.pendingVerifyCol;
         if (selectedCol > pendingCol) {
             g.pendingVerifyCol = -1;
             g.autoMessage = L"Column verified";
-            if (pendingCol >= GRID_COLS - 1) {
+            if (pendingCol >= lastTargetCol) {
                 g.autoInputEnabled = false;
-                g.autoMessage = L"Waiting success";
+                g.autoMessage = L"Waiting next level";
                 return;
             }
         } else {
@@ -1142,10 +1252,10 @@ static void TickAutoInput() {
     g.nextInputAt = GetTickCount64() + settleMs + 120;
 
     g.pendingVerifyCol = selectedCol;
-    if (selectedCol >= GRID_COLS - 1) {
+    if (selectedCol >= lastTargetCol) {
         g.finalSubmitAt = GetTickCount64();
     }
-    g.autoMessage = selectedCol >= GRID_COLS - 1 ? L"Waiting success" : L"Verifying column";
+    g.autoMessage = selectedCol >= lastTargetCol ? L"Waiting next level" : L"Verifying column";
 }
 
 static void PositionOverlay();
@@ -1161,7 +1271,6 @@ static void ClearLevelState(const wchar_t* reason) {
     g.autoInputEnabled = false;
     g.pendingVerifyCol = -1;
     g.finalSubmitAt = 0;
-    g.successVisible = false;
     g.autoMessage = reason;
     g.current = Pattern{};
     g.answerPath = Pattern{};
@@ -1172,6 +1281,11 @@ static void ClearLevelState(const wchar_t* reason) {
 
 static void ClearRuntimeState(const wchar_t* reason) {
     g.circlesReady = false;
+    g.levelSlot = 0;
+    g.observedLevelSlot = 0;
+    g.observedLevelStableFrames = 0;
+    g.levelFocusVisible = false;
+    g.levelFocus = UiRect{};
     if (wcscmp(reason, L"Not in minigame") == 0) {
         g.minigameVisible = false;
     }
@@ -1289,6 +1403,42 @@ static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SelectObject(hdc, oldPen);
             DeleteObject(pen);
         }
+
+        if (g.levelFocusVisible && g.observedLevelStableFrames >= 2) {
+            int screenH = std::max(1, GetSystemMetrics(SM_CYSCREEN));
+            int cx = (g.levelFocus.left + g.levelFocus.right) / 2;
+            int top = g.levelFocus.bottom + ScalePx(8, screenH);
+            int halfW = ScalePx(11, screenH);
+            int triH = ScalePx(10, screenH);
+            POINT shadow[3]{
+                { cx, top + triH + ScalePx(2, screenH) },
+                { cx - halfW - ScalePx(2, screenH), top - ScalePx(2, screenH) },
+                { cx + halfW + ScalePx(2, screenH), top - ScalePx(2, screenH) }
+            };
+            HBRUSH shadowBrush = CreateSolidBrush(RGB(8, 12, 10));
+            HGDIOBJ oldBrush = SelectObject(hdc, shadowBrush);
+            HPEN shadowPen = CreatePen(PS_SOLID, ScalePx(1, screenH), RGB(8, 12, 10));
+            HGDIOBJ oldPen = SelectObject(hdc, shadowPen);
+            Polygon(hdc, shadow, 3);
+            SelectObject(hdc, oldPen);
+            DeleteObject(shadowPen);
+
+            POINT tri[3]{
+                { cx, top + triH },
+                { cx - halfW, top },
+                { cx + halfW, top }
+            };
+            HBRUSH brush = CreateSolidBrush(RGB(0, 245, 95));
+            HPEN pen = CreatePen(PS_SOLID, ScalePx(1, screenH), RGB(0, 255, 120));
+            SelectObject(hdc, brush);
+            SelectObject(hdc, pen);
+            Polygon(hdc, tri, 3);
+            SelectObject(hdc, oldPen);
+            SelectObject(hdc, oldBrush);
+            DeleteObject(pen);
+            DeleteObject(brush);
+            DeleteObject(shadowBrush);
+        }
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -1299,11 +1449,11 @@ static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 static void OnTimer() {
     if (!g.running) return;
     bool detectBlue = !g.tracker.targetReady;
-    bool checkSuccess = g.circlesReady;
-    g.successVisible = checkSuccess ? IsSuccessPopupVisible() : false;
-    if (g.successVisible) {
+    bool levelChanged = false;
+    UpdateObservedLevelSlot(DetectLevelSlot(), &levelChanged, AwaitingFinalSubmitResult());
+    if (levelChanged) {
         ++g.frameCount;
-        ClearLevelState(L"Success");
+        ClearLevelState(L"Next level");
         PositionOverlay();
         InvalidateRect(g.overlayWnd, nullptr, TRUE);
         UpdateStatus();
@@ -1344,7 +1494,8 @@ static void OnTimer() {
         ++g.frameCount;
         g.selectedIndex = -1;
         g.selectedScore = 0;
-        g.autoMessage = g.pendingVerifyCol >= GRID_COLS - 1 ? L"Waiting success" : L"Verifying column";
+        int lastTargetCol = LastTargetColumn(g.tracker.target);
+        g.autoMessage = g.pendingVerifyCol >= lastTargetCol ? L"Waiting next level" : L"Verifying column";
         g.message = g.autoMessage;
         PositionOverlay();
         InvalidateRect(g.overlayWnd, nullptr, TRUE);
@@ -1354,24 +1505,10 @@ static void OnTimer() {
 
     if (AwaitingFinalSubmitResult()) {
         ++g.frameCount;
-        if (FinalSubmitEmptyCheckDue()) {
-            CaptureResult emptyCheck = CaptureFrame(true);
-            g.current = emptyCheck.pattern;
-            g.selectedIndex = emptyCheck.selectedIndex;
-            g.selectedScore = emptyCheck.selectedScore;
-            if (UpdateFinalSubmitEmptyCheck(emptyCheck)) {
-                ClearLevelState(L"Next level");
-                g.message = L"Next level";
-            } else {
-                g.autoMessage = L"Checking empty panel";
-                g.message = g.autoMessage;
-            }
-        } else {
-            g.selectedIndex = -1;
-            g.selectedScore = 0;
-            g.autoMessage = L"Waiting success";
-            g.message = g.autoMessage;
-        }
+        g.selectedIndex = -1;
+        g.selectedScore = 0;
+        g.autoMessage = L"Waiting next level";
+        g.message = g.autoMessage;
         PositionOverlay();
         InvalidateRect(g.overlayWnd, nullptr, TRUE);
         UpdateStatus();
@@ -1430,6 +1567,11 @@ static void ResetHistory() {
     g.selectedScore = 0;
     g.lastSelectedIndex = -1;
     g.selectedStableFrames = 0;
+    g.levelSlot = 0;
+    g.observedLevelSlot = 0;
+    g.observedLevelStableFrames = 0;
+    g.levelFocusVisible = false;
+    g.levelFocus = UiRect{};
     g.nextInputAt = 0;
     g.autoInputEnabled = false;
     g.pendingVerifyCol = -1;
@@ -1518,10 +1660,6 @@ bool RunSession(const std::function<bool()>& stopRequested,
   AutoLocateRoi();
   syncOverlay();
   int lostFrames = 0;
-  bool successLatched = false;
-  DWORD64 successHitWindowStart = 0;
-  int successHitFrames = 0;
-  DWORD64 successGoneAt = 0;
   bool completedAnyLevel = false;
   setStatus(L"flashing: locating");
   while (!stopRequested()) {
@@ -1529,56 +1667,14 @@ bool RunSession(const std::function<bool()>& stopRequested,
     CaptureResult capture;
     bool detectBlue = !g.tracker.targetReady;
     syncOverlay();
-    bool checkSuccess = g.circlesReady || successLatched;
-    if (checkSuccess) {
-      g.successVisible = IsSuccessPopupVisible();
-    } else {
-      g.successVisible = false;
-    }
-    DWORD64 nowTick = GetTickCount64();
-    if (g.successVisible) {
-      if (successHitWindowStart == 0 || nowTick - successHitWindowStart > kSuccessHitWindowMs) {
-        successHitWindowStart = nowTick;
-        successHitFrames = 0;
-      }
-      ++successHitFrames;
-      successGoneAt = 0;
-    } else if (!successLatched && successHitWindowStart != 0 && nowTick - successHitWindowStart > kSuccessHitWindowMs) {
-      successHitWindowStart = 0;
-      successHitFrames = 0;
-    }
-    bool successStable = g.successVisible && successHitFrames >= kSuccessHitFramesBeforeLevelComplete;
-    if (g.successVisible && !successLatched && !successStable) {
-      setStatus(L"flashing: confirming success");
+    bool levelChanged = false;
+    UpdateObservedLevelSlot(DetectLevelSlot(), &levelChanged, AwaitingFinalSubmitResult());
+    if (levelChanged) {
+      completedAnyLevel = true;
+      setStatus(L"flashing: next level");
+      ClearLevelState(L"Next level");
       if (g.overlayWnd && overlayEnabled()) InvalidateRect(g.overlayWnd, nullptr, TRUE);
       Sleep(0);
-      continue;
-    }
-    if (successStable || successLatched) {
-      completedAnyLevel = true;
-      if (g.successVisible) {
-        if (!successLatched) {
-          ClearLevelState(L"Success");
-          g.successVisible = true;
-        }
-        successLatched = true;
-        successGoneAt = 0;
-        setStatus(L"flashing: level complete");
-      } else {
-        if (successGoneAt == 0) successGoneAt = nowTick;
-        if (nowTick - successGoneAt < kSuccessGoneMsBeforeNextLevel) {
-          setStatus(L"flashing: level complete");
-        } else {
-          successLatched = false;
-          successHitWindowStart = 0;
-          successHitFrames = 0;
-          successGoneAt = 0;
-          setStatus(L"flashing: next level");
-          ClearLevelState(L"Next level");
-        }
-      }
-      if (g.overlayWnd && overlayEnabled()) InvalidateRect(g.overlayWnd, nullptr, TRUE);
-      Sleep(g.successVisible ? TIMER_MS : 0);
       continue;
     }
     bool checkMinigame = !g.circlesReady || (g.frameCount % kMinigameCheckIntervalFrames) == 0;
@@ -1601,36 +1697,21 @@ bool RunSession(const std::function<bool()>& stopRequested,
     if (WaitingColumnVerify()) {
       g.selectedIndex = -1;
       g.selectedScore = 0;
-      g.autoMessage = g.pendingVerifyCol >= GRID_COLS - 1 ? L"Waiting success" : L"Verifying column";
+      int lastTargetCol = LastTargetColumn(g.tracker.target);
+      g.autoMessage = g.pendingVerifyCol >= lastTargetCol ? L"Waiting next level" : L"Verifying column";
       g.message = g.autoMessage;
-      setStatus(g.pendingVerifyCol >= GRID_COLS - 1 ? L"flashing: waiting success" : L"flashing: verifying column");
+      setStatus(g.pendingVerifyCol >= lastTargetCol ? L"flashing: waiting next level" : L"flashing: verifying column");
       if (g.overlayWnd && overlayEnabled()) InvalidateRect(g.overlayWnd, nullptr, TRUE);
       Sleep(0);
       continue;
     }
     if (AwaitingFinalSubmitResult()) {
-      if (FinalSubmitEmptyCheckDue()) {
-        CaptureResult emptyCheck = CaptureFrame(true);
-        ++g.frameCount;
-        g.current = emptyCheck.pattern;
-        g.selectedIndex = emptyCheck.selectedIndex;
-        g.selectedScore = emptyCheck.selectedScore;
-        if (UpdateFinalSubmitEmptyCheck(emptyCheck)) {
-          completedAnyLevel = true;
-          setStatus(L"flashing: next level");
-          ClearLevelState(L"Next level");
-        } else {
-          g.autoMessage = L"Checking empty panel";
-          g.message = g.autoMessage;
-          setStatus(L"flashing: checking empty panel");
-        }
-      } else {
-        g.selectedIndex = -1;
-        g.selectedScore = 0;
-        g.autoMessage = L"Waiting success";
-        g.message = g.autoMessage;
-        setStatus(L"flashing: waiting success");
-      }
+      ++g.frameCount;
+      g.selectedIndex = -1;
+      g.selectedScore = 0;
+      g.autoMessage = L"Waiting next level";
+      g.message = g.autoMessage;
+      setStatus(L"flashing: waiting next level");
       if (g.overlayWnd && overlayEnabled()) InvalidateRect(g.overlayWnd, nullptr, TRUE);
       Sleep(0);
       continue;
