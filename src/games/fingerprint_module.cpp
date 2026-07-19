@@ -35,6 +35,8 @@ struct Region {
 
 struct Frame {
     int x = 0, y = 0, w = 0, h = 0;
+    int screenW = 0, screenH = 0;
+    double toScreenX = 1.0, toScreenY = 1.0;
     std::vector<uint8_t> bgra;
     std::vector<uint8_t> gray;
 };
@@ -162,6 +164,23 @@ static Rect clampRect(Rect r, int w, int h) {
     r.w = std::max(0, std::min(r.w, w - r.x));
     r.h = std::max(0, std::min(r.h, h - r.y));
     return r;
+}
+
+static Rect scaleRectToScreen(const Frame& f, Rect r) {
+    int x1 = (int)std::lround(r.x * f.toScreenX);
+    int y1 = (int)std::lround(r.y * f.toScreenY);
+    int x2 = (int)std::lround((r.x + r.w) * f.toScreenX);
+    int y2 = (int)std::lround((r.y + r.h) * f.toScreenY);
+    return clampRect({x1, y1, x2 - x1, y2 - y1}, f.screenW > 0 ? f.screenW : f.w, f.screenH > 0 ? f.screenH : f.h);
+}
+
+static OverlayState scaleOverlayStateToScreen(const Frame& f, OverlayState s) {
+    if (std::abs(f.toScreenX - 1.0) < 1e-6 && std::abs(f.toScreenY - 1.0) < 1e-6) return s;
+    s.target = scaleRectToScreen(f, s.target);
+    for (auto& b : s.blocks) {
+        b.rect = scaleRectToScreen(f, b.rect);
+    }
+    return s;
 }
 
 static Rect padRect(Rect r, int w, int h, double ratio) {
@@ -341,6 +360,12 @@ static bool captureScreen(Frame& out) {
     gVirtualY = 0;
     gVirtualW = GetSystemMetrics(SM_CXSCREEN);
     gVirtualH = GetSystemMetrics(SM_CYSCREEN);
+    int captureW = gVirtualW;
+    int captureH = gVirtualH;
+    if (gVirtualH > 1080) {
+        captureH = 1080;
+        captureW = std::max(1, (int)std::lround(gVirtualW * (captureH / (double)gVirtualH)));
+    }
 
     static HDC mem = nullptr;
     static HBITMAP bmp = nullptr;
@@ -360,7 +385,7 @@ static bool captureScreen(Frame& out) {
         }
     }
 
-    if (!bmp || bufW != gVirtualW || bufH != gVirtualH) {
+    if (!bmp || bufW != captureW || bufH != captureH) {
         if (bmp) {
             SelectObject(mem, oldObj);
             DeleteObject(bmp);
@@ -371,8 +396,8 @@ static bool captureScreen(Frame& out) {
 
         BITMAPINFO bi{};
         bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        bi.bmiHeader.biWidth = gVirtualW;
-        bi.bmiHeader.biHeight = -gVirtualH;
+        bi.bmiHeader.biWidth = captureW;
+        bi.bmiHeader.biHeight = -captureH;
         bi.bmiHeader.biPlanes = 1;
         bi.bmiHeader.biBitCount = 32;
         bi.bmiHeader.biCompression = BI_RGB;
@@ -384,20 +409,24 @@ static bool captureScreen(Frame& out) {
             return false;
         }
         oldObj = SelectObject(mem, bmp);
-        bufW = gVirtualW;
-        bufH = gVirtualH;
+        bufW = captureW;
+        bufH = captureH;
     }
 
-    if (!BitBlt(mem, 0, 0, gVirtualW, gVirtualH, screen, 0, 0, SRCCOPY)) {
+    SetStretchBltMode(mem, COLORONCOLOR);
+    if (!StretchBlt(mem, 0, 0, captureW, captureH, screen, 0, 0, gVirtualW, gVirtualH, SRCCOPY)) {
         ReleaseDC(nullptr, screen);
         return false;
     }
 
-    out.x = gVirtualX; out.y = gVirtualY; out.w = gVirtualW; out.h = gVirtualH;
+    out.x = gVirtualX; out.y = gVirtualY; out.w = captureW; out.h = captureH;
+    out.screenW = gVirtualW; out.screenH = gVirtualH;
+    out.toScreenX = gVirtualW / (double)std::max(1, captureW);
+    out.toScreenY = gVirtualH / (double)std::max(1, captureH);
     out.bgra.clear();
-    out.gray.resize(gVirtualW * gVirtualH);
+    out.gray.resize(captureW * captureH);
     const uint8_t* px = (const uint8_t*)bits;
-    for (int i = 0; i < gVirtualW * gVirtualH; ++i) {
+    for (int i = 0; i < captureW * captureH; ++i) {
         uint8_t b = px[i * 4 + 0], g = px[i * 4 + 1], r = px[i * 4 + 2];
         out.gray[i] = (uint8_t)((77 * r + 150 * g + 29 * b) >> 8);
     }
@@ -573,23 +602,6 @@ static RoiInfo detectMinigame(const Frame& f, std::string* diag = nullptr) {
     return info;
 }
 
-static std::vector<Rect> inferredComponentGrid(const RoiInfo& roi, int frameW, int frameH) {
-    Rect cb = roi.bars.components;
-    int tile = std::max(scaledPx(frameW, frameH, 24), (int)std::lround(cb.w * 0.26));
-    int x0 = cb.x + (int)std::lround(cb.w * 0.22);
-    int x1 = cb.x + (int)std::lround(cb.w * 0.53);
-    int y0 = cb.y + cb.h + (int)std::lround(tile * 0.15);
-    int stepY = (int)std::lround(tile * 1.18);
-
-    std::vector<Rect> out;
-    for (int row = 0; row < 4; ++row) {
-        int y = y0 + row * stepY;
-        out.push_back(clampRect({x0, y, tile, tile}, frameW, frameH));
-        out.push_back(clampRect({x1, y, tile, tile}, frameW, frameH));
-    }
-    return out;
-}
-
 static std::vector<int> edgeLinePeaks(const std::vector<int>& projection, int base, int minDist, double thresholdRatio) {
     if (projection.empty()) return {};
 
@@ -730,9 +742,9 @@ static bool detectRois(const Frame& f, const RoiInfo& roi, Rect& target, std::ve
     target = clampRect({targetLeft, targetTop, targetRight - targetLeft, targetBottom - targetTop}, f.w, f.h);
 
     std::string compDiag;
-    bool borderComponents = detectComponentBoxesByBorder(f, roi, components, &compDiag);
-    if (!borderComponents) {
-        components = inferredComponentGrid(roi, f.w, f.h);
+    if (!detectComponentBoxesByBorder(f, roi, components, &compDiag)) {
+        if (diag) *diag = "component ROI failed: " + compDiag;
+        return false;
     }
     if (target.w <= 0 || target.h <= 0 || components.size() != 8) {
         if (diag) *diag = "component ROI failed: " + compDiag;
@@ -741,9 +753,8 @@ static bool detectRois(const Frame& f, const RoiInfo& roi, Rect& target, std::ve
 
     if (diag) {
         char buf[192];
-        std::snprintf(buf, sizeof(buf), "target=%s components=8 source=%s %s",
+        std::snprintf(buf, sizeof(buf), "target=%s components=8 source=border %s",
                       rectText(target).c_str(),
-                      borderComponents ? "border" : "title-grid",
                       compDiag.c_str());
         *diag = buf;
     }
@@ -1049,8 +1060,14 @@ static void planAndRunAutomation(const OverlayState& state, AutomationState& aut
         return;
     }
 
-    if (aut.submitted && aut.plannedHash == state.targetHash) {
-        return;
+    if (aut.submitted) {
+        if (aut.plannedHash != state.targetHash) {
+            aut.submitted = false;
+            aut.plannedHash = 0;
+        } else {
+            aut.submitted = false;
+            if (diag) *diag = "auto retry after submit without success";
+        }
     }
 
     int cur = cursorIndex(state);
@@ -1374,7 +1391,7 @@ static void workerLoop() {
             OverlayState state = analyzeFrame(f, cache, nullptr, &timing);
             std::string autoDiag;
             phaseStart = Clock::now();
-            publishState(state);
+            publishState(scaleOverlayStateToScreen(f, state));
             timing.publishMs = msSince(phaseStart);
             phaseStart = Clock::now();
             planAndRunAutomation(state, automation, &autoDiag);
@@ -1651,7 +1668,7 @@ bool RunSession(const std::function<bool()>& stopRequested,
       Sleep(120);
       continue;
     }
-    publishState(overlayEnabled() ? state : OverlayState{});
+    publishState(overlayEnabled() ? scaleOverlayStateToScreen(frame, state) : OverlayState{});
     std::string autoDiag;
     setStatus(state.visible ? L"fingerprint: auto input" : L"fingerprint: locating");
     planAndRunAutomation(state, automation, &autoDiag);

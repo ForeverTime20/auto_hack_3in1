@@ -7,7 +7,8 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <shellapi.h>
+#include <propidl.h>
+#include <gdiplus.h>
 
 #include <atomic>
 #include <chrono>
@@ -22,11 +23,11 @@ namespace {
 constexpr UINT kMsgLog = WM_APP + 1;
 constexpr UINT kMsgStatus = WM_APP + 2;
 constexpr UINT kMsgWorkerDone = WM_APP + 3;
-constexpr UINT kMsgTray = WM_APP + 4;
-constexpr UINT kTrayIconId = 3001;
 
 HWND g_host = nullptr;
-HICON g_trayIcon = nullptr;
+HICON g_appIcon = nullptr;
+bool g_appIconOwned = false;
+ULONG_PTR g_gdiplusToken = 0;
 HANDLE g_singleInstanceMutex = nullptr;
 
 enum class GameKind {
@@ -74,34 +75,44 @@ void PostLog(const std::wstring& text) {
   gta5::games::slider::PostModuleLog(text);
 }
 
-void AddTrayIcon(HWND hwnd) {
-  g_trayIcon = LoadIconW(nullptr, IDI_APPLICATION);
-  NOTIFYICONDATAW nid{};
-  nid.cbSize = sizeof(nid);
-  nid.hWnd = hwnd;
-  nid.uID = kTrayIconId;
-  nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
-  nid.uCallbackMessage = kMsgTray;
-  nid.hIcon = g_trayIcon;
-  wcscpy_s(nid.szTip, L"Auto Hack 3in1");
-  Shell_NotifyIconW(NIM_ADD, &nid);
+std::wstring AppIconPath() {
+  wchar_t modulePath[MAX_PATH]{};
+  DWORD len = GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
+  std::wstring path = (len > 0) ? std::wstring(modulePath, len) : L".";
+  size_t slash = path.find_last_of(L"\\/");
+  path = (slash == std::wstring::npos) ? L"icon\\icon.png" : path.substr(0, slash + 1) + L"icon\\icon.png";
+  return path;
 }
 
-void RemoveTrayIcon(HWND hwnd) {
-  NOTIFYICONDATAW nid{};
-  nid.cbSize = sizeof(nid);
-  nid.hWnd = hwnd;
-  nid.uID = kTrayIconId;
-  Shell_NotifyIconW(NIM_DELETE, &nid);
+HICON LoadPngIcon(bool* owned) {
+  if (owned) *owned = false;
+  Gdiplus::Bitmap bitmap(AppIconPath().c_str());
+  if (bitmap.GetLastStatus() != Gdiplus::Ok) return LoadIconW(nullptr, IDI_APPLICATION);
+
+  HICON icon = nullptr;
+  if (bitmap.GetHICON(&icon) != Gdiplus::Ok || !icon) {
+    return LoadIconW(nullptr, IDI_APPLICATION);
+  }
+  if (owned) *owned = true;
+  return icon;
 }
 
-void ShowHudFromTray() {
-  HWND hud = gta5::games::slider::HudWindow();
-  if (!hud) return;
-  ShowWindow(hud, SW_SHOWNA);
-  SetWindowPos(hud, HWND_TOPMOST, 0, 0, 0, 0,
-               SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-  gta5::games::slider::RepaintHud();
+void ApplyWindowIcon(HWND hwnd) {
+  if (!hwnd || !g_appIcon) return;
+  SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(g_appIcon));
+  SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(g_appIcon));
+}
+
+void CleanupGraphics() {
+  if (g_appIcon && g_appIconOwned) {
+    DestroyIcon(g_appIcon);
+  }
+  g_appIcon = nullptr;
+  g_appIconOwned = false;
+  if (g_gdiplusToken) {
+    Gdiplus::GdiplusShutdown(g_gdiplusToken);
+    g_gdiplusToken = 0;
+  }
 }
 
 void WorkerMain() {
@@ -188,7 +199,6 @@ LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
   switch (msg) {
     case WM_CREATE:
       gta5::games::slider::ApplyHotkey(hwnd);
-      AddTrayIcon(hwnd);
       return 0;
     case WM_HOTKEY:
       if (static_cast<int>(wp) == gta5::games::slider::HotkeyId()) {
@@ -219,19 +229,12 @@ LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       gta5::games::slider::RepaintHud();
       return 0;
     }
-    case kMsgTray:
-      if (lp == WM_LBUTTONDBLCLK || lp == WM_LBUTTONUP) {
-        ShowHudFromTray();
-        return 0;
-      }
-      return 0;
     case WM_CLOSE:
       StopWorker();
       DestroyWindow(hwnd);
       return 0;
     case WM_DESTROY:
       StopWorker();
-      RemoveTrayIcon(hwnd);
       UnregisterHotKey(hwnd, gta5::games::slider::HotkeyId());
       PostQuitMessage(0);
       return 0;
@@ -244,6 +247,7 @@ void RegisterClasses(HINSTANCE inst) {
   host.lpfnWndProc = HostProc;
   host.hInstance = inst;
   host.hCursor = LoadCursor(nullptr, IDC_ARROW);
+  host.hIcon = g_appIcon;
   host.hbrBackground = reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
   host.lpszClassName = L"Gta3In1HostV2";
   RegisterClassW(&host);
@@ -252,6 +256,7 @@ void RegisterClasses(HINSTANCE inst) {
   hud.lpfnWndProc = gta5::games::slider::HudProc;
   hud.hInstance = inst;
   hud.hCursor = LoadCursor(nullptr, IDC_ARROW);
+  hud.hIcon = g_appIcon;
   hud.hbrBackground = reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
   hud.lpszClassName = L"Gta3In1HudV2";
   RegisterClassW(&hud);
@@ -293,16 +298,18 @@ bool CreateWindows(HINSTANCE inst) {
   g_host = CreateWindowExW(WS_EX_TOOLWINDOW, L"Gta3In1HostV2", L"Auto Hack 3in1 Host",
                            WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, inst, nullptr);
   if (!g_host) return false;
+  ApplyWindowIcon(g_host);
   gta5::games::slider::SetHostWindow(g_host);
 
   RECT hudRect = gta5::games::slider::InitialHudRect();
-  HWND hud = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+  HWND hud = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_APPWINDOW | WS_EX_NOACTIVATE,
                              L"Gta3In1HudV2", L"Auto Hack 3in1 HUD",
                              WS_POPUP, hudRect.left, hudRect.top,
                              gta5::games::slider::HudWidth(), gta5::games::slider::HudHeight(),
                              nullptr, nullptr, inst, nullptr);
   gta5::games::slider::SetHudWindow(hud);
   if (hud) {
+    ApplyWindowIcon(hud);
     SetLayeredWindowAttributes(hud, RGB(0, 0, 0), 255, LWA_COLORKEY);
     ShowWindow(hud, SW_SHOWNA);
   }
@@ -355,15 +362,24 @@ bool CreateWindows(HINSTANCE inst) {
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
   SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+  Gdiplus::GdiplusStartupInput gdiplusInput;
+  if (Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusInput, nullptr) == Gdiplus::Ok) {
+    g_appIcon = LoadPngIcon(&g_appIconOwned);
+  } else {
+    g_appIcon = LoadIconW(nullptr, IDI_APPLICATION);
+  }
+
   g_singleInstanceMutex = CreateMutexW(nullptr, TRUE, L"Local\\AutoHack3in1SingleInstance");
   if (!g_singleInstanceMutex) {
     MessageBoxW(nullptr, L"Failed to start Auto Hack 3in1.", L"Auto Hack 3in1", MB_ICONERROR | MB_OK);
+    CleanupGraphics();
     return 1;
   }
   if (GetLastError() == ERROR_ALREADY_EXISTS) {
     MessageBoxW(nullptr, L"Auto Hack 3in1 is already running.", L"Auto Hack 3in1", MB_ICONINFORMATION | MB_OK);
     CloseHandle(g_singleInstanceMutex);
     g_singleInstanceMutex = nullptr;
+    CleanupGraphics();
     return 0;
   }
 
@@ -372,7 +388,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
   gta5::games::fingerprint::InitStateLock();
 
   RegisterClasses(inst);
-  if (!CreateWindows(inst)) return 1;
+  if (!CreateWindows(inst)) {
+    CleanupGraphics();
+    return 1;
+  }
 
   PostLog(L"3-in-1 ready: press " + gta5::games::slider::HotkeyName() + L" to start/stop");
   PostStatus(L"3-in-1 idle");
@@ -389,5 +408,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     CloseHandle(g_singleInstanceMutex);
     g_singleInstanceMutex = nullptr;
   }
+  CleanupGraphics();
   return 0;
 }

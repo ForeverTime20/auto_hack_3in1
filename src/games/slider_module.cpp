@@ -1545,6 +1545,12 @@ void StopWorker() {
 
 LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
   switch (msg) {
+    case WM_CLOSE:
+      if (g_mainWnd && hwnd != g_mainWnd) {
+        PostMessageW(g_mainWnd, WM_CLOSE, 0, 0);
+        return 0;
+      }
+      return DefWindowProcW(hwnd, msg, wParam, lParam);
     case WM_CREATE:
       SetTimer(hwnd, 1, 100, nullptr);
       return 0;
