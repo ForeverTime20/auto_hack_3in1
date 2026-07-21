@@ -10,6 +10,7 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
     UNICODE
     _UNICODE
     NOMINMAX
+    _WIN32_WINNT=0x0A00
 )
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
