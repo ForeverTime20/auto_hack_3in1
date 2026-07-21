@@ -1553,7 +1553,7 @@ static HWND MakeLabel(HWND parent, const wchar_t* text, int x, int y, int w, int
 
 static HWND MakeEdit(HWND parent, int id, int x, int y, int w, int h, int value) {
     HWND edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_NUMBER,
-                                x, y, w, h, parent, reinterpret_cast<HMENU>(id),
+                                x, y, w, h, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
                                 GetModuleHandleW(nullptr), nullptr);
     SetEditInt(edit, value);
     return edit;
