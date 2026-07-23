@@ -2,6 +2,10 @@ add_subdirectory(games)
 
 add_executable(${PROJECT_NAME} WIN32
     main.cpp
+    app/app_ui.cpp
+    app/app_ui.h
+    app/app_runtime.cpp
+    app/app_runtime.h
     capture/game_window.cpp
     capture/game_window.h
     resources/app.rc

@@ -1,5 +1,6 @@
 #include "../capture/game_window.h"
 #include "games.h"
+#include "../app/app_ui.h"
 
 #include <windows.h>
 
@@ -1083,8 +1084,8 @@ bool RunSession(const std::function<bool()>& stopRequested,
                 verificationPending = false;
                 setStatus(L"sort_fingerprint: round complete");
             } else {
-                const int holdMs = slider::TapHoldMs();
-                const int gapMs = slider::TapGapMs();
+                const int holdMs = gta5::app::ui::TapHoldMs();
+                const int gapMs = gta5::app::ui::TapGapMs();
                 const auto sendStarted = Clock::now();
                 if (sendPlan(plan, foreground, holdMs, gapMs)) {
                     handledHash = result.targetHash;

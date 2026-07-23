@@ -1,6 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include "games.h"
+#include "../app/app_ui.h"
 #include "../capture/game_window.h"
 #ifdef CLI_TEST
 #include <olectl.h>
@@ -894,9 +895,9 @@ static void sendScanCode(WORD scanCode, bool keyUp = false, bool extended = fals
 
 static void tapScanCode(WORD scanCode, bool extended = false) {
     sendScanCode(scanCode, false, extended);
-    Sleep((DWORD)gta5::games::slider::TapHoldMs());
+    Sleep((DWORD)gta5::app::ui::TapHoldMs());
     sendScanCode(scanCode, true, extended);
-    Sleep((DWORD)gta5::games::slider::TapGapMs());
+    Sleep((DWORD)gta5::app::ui::TapGapMs());
 }
 
 static void tapUp() { tapScanCode(0x48, true); }

@@ -1,6 +1,8 @@
 #include <windows.h>
 #include <windowsx.h>
 #include "../capture/game_window.h"
+#include "../app/app_ui.h"
+#include "../app/app_runtime.h"
 
 #include <algorithm>
 #include <atomic>
@@ -8,9 +10,7 @@
 #include <cmath>
 #include <cstring>
 #include <cstdint>
-#include <fstream>
 #include <iomanip>
-#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -23,30 +23,22 @@ namespace {
 
 constexpr UINT WM_APP_LOG = WM_APP + 1;
 constexpr UINT WM_APP_STATUS = WM_APP + 2;
-constexpr UINT WM_APP_WORKER_DONE = WM_APP + 3;
-constexpr int kHotkeyToggleId = 2001;
 constexpr double kBaselineScreenHeightPx = 1080.0;
 constexpr double kEdgeActionWindowSeconds = 0.035;
 constexpr double kEdgeTriggerZonePx = 80.0;
 constexpr double kMinUsableVelocityPxPerSec = 25.0;
 constexpr double kLateGraceSeconds = 0.010;
 constexpr double kInvalidPredictionSeconds = 999.0;
-constexpr int kHudWidth = 300;
-constexpr int kHudMiniWidth = 236;
-constexpr int kHudMiniHeight = 42;
-constexpr int kHudCollapsedHeight = 118;
-constexpr int kHudExpandedHeight = 260;
-constexpr int kHudMargin = 18;
-constexpr int kHudTopMargin = 118;
-constexpr ULONGLONG kHudAutoCollapseMs = 3500;
+constexpr int kOverlayMargin = 18;
 constexpr int kCursorSize = 64;
 constexpr int kCursorArrowTopOffset = 14;
 constexpr int kCursorArrowBottomOffset = 14;
 constexpr int kCursorArrowRightOffset = 14;
-
-#ifndef MOD_NOREPEAT
-#define MOD_NOREPEAT 0x4000
-#endif
+constexpr COLORREF kOverlayGreen = RGB(70, 255, 120);
+constexpr COLORREF kOverlayBrightGreen = RGB(80, 255, 140);
+constexpr COLORREF kOverlayTextGreen = RGB(145, 255, 175);
+constexpr COLORREF kOverlayDeepGreen = RGB(18, 66, 42);
+constexpr COLORREF kOverlayBlack = RGB(10, 14, 20);
 
 int ScaledPx(double value, double scale) {
   return std::max(1, static_cast<int>(std::round(value * std::clamp(scale, 0.45, 2.25))));
@@ -159,15 +151,10 @@ struct PreviewState {
 };
 
 HWND g_mainWnd = nullptr;
-HWND g_overlayWnd = nullptr;
 HWND g_cursorWnd = nullptr;
 HWND g_marksWnd = nullptr;
 
-std::atomic<bool> g_running{false};
-std::atomic<bool> g_stopWorker{false};
-std::atomic<bool> g_overlayRepaintPending{false};
 std::atomic<bool> g_marksRepaintPending{false};
-std::thread g_worker;
 std::mutex g_previewMutex;
 PreviewState g_preview;
 std::atomic<int> g_hudActiveBar{0};
@@ -177,42 +164,12 @@ std::atomic<int> g_hudDtMs{0};
 std::atomic<int> g_hudLeadMs{0};
 std::atomic<int> g_hudVelocityPx{0};
 std::atomic<int> g_hudScale100{100};
-std::atomic<int> g_hotkeyVk{VK_F6};
-std::atomic<int> g_pendingHotkeyVk{VK_F6};
-std::atomic<int> g_tapHoldMs{20};
-std::atomic<int> g_tapGapMs{30};
-std::atomic<bool> g_listeningHotkey{false};
-std::atomic<bool> g_panelExpanded{false};
-std::atomic<bool> g_settingsExpanded{false};
-std::atomic<bool> g_overlayCursorEnabled{true};
 std::atomic<bool> g_cursorVisible{false};
 std::atomic<int> g_cursorX{0};
 std::atomic<int> g_cursorY{0};
 std::atomic<int> g_cursorTargetY{0};
 std::atomic<bool> g_cursorInZone{false};
 std::atomic<int> g_cursorBar{0};
-bool g_hudUserPlaced = false;
-POINT g_hudPos{0, 0};
-bool g_hudDragging = false;
-POINT g_hudDragOffset{0, 0};
-ULONGLONG g_lastHudInteractionTick = 0;
-
-int CurrentHudHeight() {
-  if (!g_panelExpanded.load(std::memory_order_relaxed)) return kHudMiniHeight;
-  return g_settingsExpanded.load(std::memory_order_relaxed) ? kHudExpandedHeight : kHudCollapsedHeight;
-}
-
-int CurrentHudWidth() {
-  return g_panelExpanded.load(std::memory_order_relaxed) ? kHudWidth : kHudMiniWidth;
-}
-
-RECT MonitorRectFromHandle(HMONITOR monitor) {
-  MONITORINFO mi{};
-  mi.cbSize = sizeof(mi);
-  if (monitor && GetMonitorInfoW(monitor, &mi)) return mi.rcMonitor;
-  RECT primary{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
-  return primary;
-}
 
 // All tunable pixel constants are authored for a 1080p game image.
 // Runtime geometry follows the GTA client height, including windowed mode.
@@ -229,168 +186,6 @@ double GeometryScaleFromRedScreen(const RedBar& red) {
   return GeometryScaleFromScreenPoint((red.x1 + red.x2) / 2, red.centerY);
 }
 
-std::wstring FileNameOnly(const wchar_t* path) {
-  if (!path) return L"";
-  const wchar_t* slash = wcsrchr(path, L'\\');
-  const wchar_t* fwd = wcsrchr(path, L'/');
-  const wchar_t* base = std::max(slash ? slash + 1 : path, fwd ? fwd + 1 : path);
-  return base;
-}
-
-std::wstring ExeSiblingPath(const wchar_t* fileName) {
-  wchar_t path[MAX_PATH * 4]{};
-  DWORD n = GetModuleFileNameW(nullptr, path, static_cast<DWORD>(sizeof(path) / sizeof(path[0])));
-  if (n == 0 || n >= sizeof(path) / sizeof(path[0])) return fileName;
-  wchar_t* slash = wcsrchr(path, L'\\');
-  if (slash) *(slash + 1) = L'\0';
-  return std::wstring(path) + fileName;
-}
-
-bool IsValidHotkeyVk(int vk) {
-  if (vk < 8 || vk > 254) return false;
-  if (vk >= VK_LBUTTON && vk <= VK_XBUTTON2) return false;
-  return vk != VK_SHIFT && vk != VK_CONTROL && vk != VK_MENU;
-}
-
-int ClampTapMs(int value) {
-  return std::clamp(value, 1, 250);
-}
-
-std::wstring KeyName(int vk) {
-  if (vk >= VK_F1 && vk <= VK_F24) return L"F" + std::to_wstring(vk - VK_F1 + 1);
-  if (vk >= 'A' && vk <= 'Z') return std::wstring(1, static_cast<wchar_t>(vk));
-  if (vk >= '0' && vk <= '9') return std::wstring(1, static_cast<wchar_t>(vk));
-  UINT scan = MapVirtualKeyW(static_cast<UINT>(vk), MAPVK_VK_TO_VSC);
-  wchar_t name[64]{};
-  if (GetKeyNameTextW(static_cast<LONG>(scan << 16), name, 64) > 0) return name;
-  return L"VK" + std::to_wstring(vk);
-}
-
-void SaveSettings() {
-  const std::wstring path = ExeSiblingPath(L"setting.ini");
-  std::ofstream out(path.c_str(), std::ios::trunc);
-  if (!out) return;
-  out << "hotkey_vk=" << g_hotkeyVk.load(std::memory_order_relaxed) << "\n";
-  out << "overlay_cursor=" << (g_overlayCursorEnabled.load(std::memory_order_relaxed) ? 1 : 0) << "\n";
-  out << "tap_hold_ms=" << g_tapHoldMs.load(std::memory_order_relaxed) << "\n";
-  out << "tap_gap_ms=" << g_tapGapMs.load(std::memory_order_relaxed) << "\n";
-}
-
-void LoadSettings() {
-  int hotkey = VK_F6;
-  int overlay = 1;
-  int tapHold = 20;
-  int tapGap = 30;
-  bool ok = false;
-  bool needsSave = false;
-  const std::wstring path = ExeSiblingPath(L"setting.ini");
-  std::ifstream in(path.c_str());
-  if (in) {
-    std::string line;
-    bool sawHotkey = false;
-    bool sawOverlay = false;
-    bool sawTapHold = false;
-    bool sawTapGap = false;
-    while (std::getline(in, line)) {
-      const auto eq = line.find('=');
-      if (eq == std::string::npos) continue;
-      const std::string key = line.substr(0, eq);
-      const std::string value = line.substr(eq + 1);
-      try {
-        if (key == "hotkey_vk") {
-          hotkey = std::stoi(value);
-          sawHotkey = true;
-        } else if (key == "overlay_cursor") {
-          overlay = std::stoi(value);
-          sawOverlay = true;
-        } else if (key == "tap_hold_ms") {
-          tapHold = std::stoi(value);
-          sawTapHold = true;
-        } else if (key == "tap_gap_ms") {
-          tapGap = std::stoi(value);
-          sawTapGap = true;
-        }
-      } catch (...) {
-        ok = false;
-        break;
-      }
-    }
-    ok = sawHotkey && sawOverlay && IsValidHotkeyVk(hotkey) && (overlay == 0 || overlay == 1);
-    if (!sawTapHold || tapHold < 1 || tapHold > 250) {
-      tapHold = 20;
-      needsSave = true;
-    }
-    if (!sawTapGap || tapGap < 1 || tapGap > 250) {
-      tapGap = 30;
-      needsSave = true;
-    }
-  }
-  if (!ok) {
-    hotkey = VK_F6;
-    overlay = 1;
-    tapHold = 20;
-    tapGap = 30;
-    needsSave = true;
-  }
-  g_hotkeyVk.store(hotkey, std::memory_order_relaxed);
-  g_pendingHotkeyVk.store(hotkey, std::memory_order_relaxed);
-  g_overlayCursorEnabled.store(overlay != 0, std::memory_order_relaxed);
-  g_tapHoldMs.store(ClampTapMs(tapHold), std::memory_order_relaxed);
-  g_tapGapMs.store(ClampTapMs(tapGap), std::memory_order_relaxed);
-  if (needsSave) SaveSettings();
-}
-
-void ApplyHotkeySetting(HWND hwnd) {
-  if (!hwnd) return;
-  UnregisterHotKey(hwnd, kHotkeyToggleId);
-  RegisterHotKey(hwnd, kHotkeyToggleId, MOD_NOREPEAT, static_cast<UINT>(g_hotkeyVk.load(std::memory_order_relaxed)));
-}
-
-bool ProcessExeNameEquals(DWORD pid, const wchar_t* exeName) {
-  HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-  if (!process) return false;
-  wchar_t imagePath[MAX_PATH * 4]{};
-  DWORD size = static_cast<DWORD>(std::size(imagePath));
-  const bool ok = QueryFullProcessImageNameW(process, 0, imagePath, &size) &&
-                  lstrcmpiW(FileNameOnly(imagePath).c_str(), exeName) == 0;
-  CloseHandle(process);
-  return ok;
-}
-
-struct WindowByExeSearch {
-  const wchar_t* exeName = nullptr;
-  HWND hwnd = nullptr;
-  RECT rect{};
-};
-
-BOOL CALLBACK EnumWindowByExeProc(HWND hwnd, LPARAM lParam) {
-  auto* search = reinterpret_cast<WindowByExeSearch*>(lParam);
-  if (!IsWindowVisible(hwnd) || hwnd == g_mainWnd || hwnd == g_overlayWnd || hwnd == g_cursorWnd || hwnd == g_marksWnd ||
-      GetWindow(hwnd, GW_OWNER)) {
-    return TRUE;
-  }
-  RECT wr{};
-  if (!GetWindowRect(hwnd, &wr) || wr.right - wr.left < 100 || wr.bottom - wr.top < 100) {
-    return TRUE;
-  }
-  DWORD pid = 0;
-  GetWindowThreadProcessId(hwnd, &pid);
-  if (pid && ProcessExeNameEquals(pid, search->exeName)) {
-    search->hwnd = hwnd;
-    search->rect = wr;
-    return FALSE;
-  }
-  return TRUE;
-}
-
-bool FindWindowRectByExe(const wchar_t* exeName, RECT* rect) {
-  WindowByExeSearch search{exeName};
-  EnumWindows(EnumWindowByExeProc, reinterpret_cast<LPARAM>(&search));
-  if (!search.hwnd) return false;
-  if (rect) *rect = search.rect;
-  return true;
-}
-
 RECT VirtualDesktopRect() {
   return RECT{
       GetSystemMetrics(SM_XVIRTUALSCREEN),
@@ -400,14 +195,14 @@ RECT VirtualDesktopRect() {
   };
 }
 
-RECT ClampHudScreenRect(RECT panel) {
+RECT ClampOverlayScreenRect(RECT panel) {
   RECT vd = VirtualDesktopRect();
   const int panelW = panel.right - panel.left;
   const int panelH = panel.bottom - panel.top;
-  const int minLeft = static_cast<int>(vd.left) + kHudMargin;
-  const int minTop = static_cast<int>(vd.top) + kHudMargin;
-  const int maxLeft = std::max(minLeft, static_cast<int>(vd.right) - panelW - kHudMargin);
-  const int maxTop = std::max(minTop, static_cast<int>(vd.bottom) - panelH - kHudMargin);
+  const int minLeft = static_cast<int>(vd.left) + kOverlayMargin;
+  const int minTop = static_cast<int>(vd.top) + kOverlayMargin;
+  const int maxLeft = std::max(minLeft, static_cast<int>(vd.right) - panelW - kOverlayMargin);
+  const int maxTop = std::max(minTop, static_cast<int>(vd.bottom) - panelH - kOverlayMargin);
   const int left = std::clamp(static_cast<int>(panel.left), minLeft, maxLeft);
   const int top = std::clamp(static_cast<int>(panel.top), minTop, maxTop);
   panel.left = left;
@@ -417,146 +212,6 @@ RECT ClampHudScreenRect(RECT panel) {
   return panel;
 }
 
-RECT HudPanelRect(const PreviewState& state, const RECT& client) {
-  (void)state;
-  (void)client;
-  return RECT{0, 0, CurrentHudWidth(), CurrentHudHeight()};
-}
-
-RECT InitialHudScreenRect() {
-  const int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
-  const int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-
-  if (g_hudUserPlaced) {
-    return ClampHudScreenRect(RECT{g_hudPos.x, g_hudPos.y, g_hudPos.x + CurrentHudWidth(), g_hudPos.y + CurrentHudHeight()});
-  }
-
-  constexpr int kHudTopDrop = 50;
-  constexpr int kHudRightExtraInset = 28;
-  HMONITOR monitor = nullptr;
-  if (vw == 5760) {
-    const int middleRight = vx + 1920 * 2;
-    const int topBase = GetSystemMetrics(SM_YVIRTUALSCREEN);
-    const int left = middleRight - CurrentHudWidth() - kHudMargin - kHudRightExtraInset;
-    const int top = topBase + kHudTopDrop;
-    return ClampHudScreenRect(RECT{left, top, left + CurrentHudWidth(), top + CurrentHudHeight()});
-  }
-
-  RECT gtaRect{};
-  if (FindWindowRectByExe(L"GTA5_Enhanced.exe", &gtaRect) ||
-      FindWindowRectByExe(L"GTA5.exe", &gtaRect)) {
-    monitor = MonitorFromRect(&gtaRect, MONITOR_DEFAULTTONEAREST);
-  }
-  if (!monitor) {
-    HWND fg = GetForegroundWindow();
-    if (fg && fg != g_mainWnd && fg != g_overlayWnd) {
-      RECT wr{};
-      if (GetWindowRect(fg, &wr)) monitor = MonitorFromRect(&wr, MONITOR_DEFAULTTONEAREST);
-    }
-  }
-  if (!monitor) {
-    POINT cursor{};
-    GetCursorPos(&cursor);
-    monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
-  }
-
-  RECT mr = MonitorRectFromHandle(monitor);
-  const int left = mr.right - CurrentHudWidth() - kHudMargin - kHudRightExtraInset;
-  const int top = mr.top + kHudTopDrop;
-  RECT panel{
-      left,
-      top,
-      left + CurrentHudWidth(),
-      top + CurrentHudHeight(),
-  };
-
-  return ClampHudScreenRect(panel);
-}
-
-RECT HudExitButtonRect(const RECT& panel) {
-  return RECT{panel.right - 36, panel.top + 10, panel.right - 14, panel.top + 32};
-}
-
-RECT HudCollapseButtonRect(const RECT& panel) {
-  return RECT{panel.right - 66, panel.top + 10, panel.right - 44, panel.top + 32};
-}
-
-RECT HudHeaderRect(const RECT& panel) {
-  return RECT{panel.left, panel.top, panel.right, panel.top + 42};
-}
-
-RECT HudSettingsToggleRect(const RECT& panel) {
-  return RECT{panel.right - 42, panel.top + 84, panel.right - 16, panel.top + 104};
-}
-
-RECT HudHotkeyRect(const RECT& panel) {
-  return RECT{panel.left + 92, panel.top + 112, panel.left + 190, panel.top + 140};
-}
-
-RECT HudConfirmRect(const RECT& panel) {
-  return RECT{panel.left + 204, panel.top + 112, panel.left + 286, panel.top + 140};
-}
-
-RECT HudOverlayCheckRect(const RECT& panel) {
-  return RECT{panel.left + 18, panel.top + 150, panel.left + 36, panel.top + 168};
-}
-
-RECT HudTapHoldMinusRect(const RECT& panel) {
-  return RECT{panel.left + 162, panel.top + 190, panel.left + 184, panel.top + 214};
-}
-
-RECT HudTapHoldValueRect(const RECT& panel) {
-  return RECT{panel.left + 188, panel.top + 190, panel.left + 226, panel.top + 214};
-}
-
-RECT HudTapHoldPlusRect(const RECT& panel) {
-  return RECT{panel.left + 230, panel.top + 190, panel.left + 252, panel.top + 214};
-}
-
-RECT HudTapGapMinusRect(const RECT& panel) {
-  return RECT{panel.left + 162, panel.top + 220, panel.left + 184, panel.top + 244};
-}
-
-RECT HudTapGapValueRect(const RECT& panel) {
-  return RECT{panel.left + 188, panel.top + 220, panel.left + 226, panel.top + 244};
-}
-
-RECT HudTapGapPlusRect(const RECT& panel) {
-  return RECT{panel.left + 230, panel.top + 220, panel.left + 252, panel.top + 244};
-}
-
-void ResizeHudToCurrent(HWND hwnd) {
-  if (!hwnd) return;
-  RECT wr{};
-  GetWindowRect(hwnd, &wr);
-  RECT desired{wr.left, wr.top, wr.left + CurrentHudWidth(), wr.top + CurrentHudHeight()};
-  RECT clamped = ClampHudScreenRect(desired);
-  g_hudPos = POINT{clamped.left, clamped.top};
-  g_hudUserPlaced = true;
-  SetWindowPos(hwnd, HWND_TOPMOST, clamped.left, clamped.top, CurrentHudWidth(), CurrentHudHeight(),
-               SWP_NOACTIVATE | SWP_NOOWNERZORDER);
-}
-
-void TouchHudInteraction() {
-  g_lastHudInteractionTick = GetTickCount64();
-}
-
-void CollapseHudPanel(HWND hwnd) {
-  g_panelExpanded.store(false, std::memory_order_relaxed);
-  g_settingsExpanded.store(false, std::memory_order_relaxed);
-  g_listeningHotkey.store(false, std::memory_order_relaxed);
-  ResizeHudToCurrent(hwnd);
-  if (hwnd) InvalidateRect(hwnd, nullptr, FALSE);
-}
-
-void ExpandHudPanel(HWND hwnd) {
-  g_panelExpanded.store(true, std::memory_order_relaxed);
-  g_listeningHotkey.store(false, std::memory_order_relaxed);
-  TouchHudInteraction();
-  ResizeHudToCurrent(hwnd);
-  if (hwnd) InvalidateRect(hwnd, nullptr, FALSE);
-}
-
 PreviewState SnapshotPreviewState() {
   static PreviewState cached;
   std::unique_lock<std::mutex> lock(g_previewMutex, std::try_to_lock);
@@ -564,12 +219,8 @@ PreviewState SnapshotPreviewState() {
   return cached;
 }
 
-void RequestOverlayRepaint() {
+void RequestMarksRepaint() {
   bool expected = false;
-  if (g_overlayWnd && g_overlayRepaintPending.compare_exchange_strong(expected, true)) {
-    InvalidateRect(g_overlayWnd, nullptr, FALSE);
-  }
-  expected = false;
   if (g_marksWnd && g_marksRepaintPending.compare_exchange_strong(expected, true)) {
     InvalidateRect(g_marksWnd, nullptr, FALSE);
   }
@@ -1109,7 +760,7 @@ void PressEnter() {
 }
 
 void WaitUntilPrecise(std::chrono::steady_clock::time_point target) {
-  while (!g_stopWorker.load()) {
+  while (!gta5::app::runtime::StopRequested()) {
     const auto now = std::chrono::steady_clock::now();
     if (now >= target) break;
     const auto remain = target - now;
@@ -1225,7 +876,7 @@ void UpdatePreview(const CaptureFrame& frame,
   next.hasFrame = true;
   next.hasRed = analysis.red.ok;
   next.hasYellow = yellow && yellow->ok;
-  next.running = g_running.load();
+  next.running = gta5::app::runtime::Running();
   next.red = analysis.red;
   next.yellow = yellow ? *yellow : YellowMeasure{};
   next.status = status;
@@ -1257,7 +908,8 @@ void UpdatePreview(const CaptureFrame& frame,
   if (lock.owns_lock()) {
     next.lastLog = g_preview.lastLog;
     g_preview = std::move(next);
-    RequestOverlayRepaint();
+    lock.unlock();
+    RequestMarksRepaint();
   }
 }
 
@@ -1290,7 +942,7 @@ void WorkerLoop() {
   bool finishPendingAfter8 = false;
   auto finishConfirmStart = std::chrono::steady_clock::now();
   int slowFrameStreak = 0;
-  while (!g_stopWorker.load()) {
+  while (!gta5::app::runtime::StopRequested()) {
     const auto frameTime = std::chrono::steady_clock::now();
     const int frameDtMs = static_cast<int>(std::round(std::chrono::duration<double, std::milli>(frameTime - lastFrameTime).count()));
     lastFrameTime = frameTime;
@@ -1299,7 +951,7 @@ void WorkerLoop() {
       if (slowFrameStreak >= 3) {
         PostLog(L"Error: dt > 30ms for 3 consecutive frames; stopping.");
         PostStatus(L"analysis latency too high; stopped");
-        g_stopWorker.store(true);
+        gta5::app::runtime::RequestStop();
         break;
       }
       std::this_thread::yield();
@@ -1418,7 +1070,7 @@ void WorkerLoop() {
       if (!activeFoundOnce && std::chrono::steady_clock::now() - activeSearchStart > std::chrono::seconds(10)) {
         PostLog(L"Error: active bar not found within 10s; stopping.");
         PostStatus(L"active bar timeout; stopped");
-        g_stopWorker.store(true);
+        gta5::app::runtime::RequestStop();
         break;
       }
       g_cursorVisible.store(false, std::memory_order_relaxed);
@@ -1426,7 +1078,7 @@ void WorkerLoop() {
       if (finishPendingAfter8 && std::chrono::steady_clock::now() - finishConfirmStart > std::chrono::milliseconds(650)) {
         PostLog(L"Completed: bar 8 confirmed without rollback; stopping.");
         PostStatus(L"completed; stopped");
-        g_stopWorker.store(true);
+        gta5::app::runtime::RequestStop();
         break;
       }
       if (++yellowMissFrames >= 3) lastYellowIndex = -1;
@@ -1450,7 +1102,7 @@ void WorkerLoop() {
       } else if (std::chrono::steady_clock::now() - finishConfirmStart > std::chrono::milliseconds(900)) {
         PostLog(L"Completed: bar 8 confirmed; stopping.");
         PostStatus(L"completed; stopped");
-        g_stopWorker.store(true);
+        gta5::app::runtime::RequestStop();
         break;
       }
     }
@@ -1542,428 +1194,6 @@ void WorkerLoop() {
   PostLog(L"stopped");
 }
 
-void StartWorker() {
-  if (g_running.load()) return;
-  g_cursorVisible.store(false, std::memory_order_relaxed);
-  g_cursorInZone.store(false, std::memory_order_relaxed);
-  if (g_marksWnd) ShowWindow(g_marksWnd, SW_HIDE);
-  g_hudActiveBar.store(0, std::memory_order_relaxed);
-  g_hudTtcMs.store(-1, std::memory_order_relaxed);
-  g_hudDtMs.store(0, std::memory_order_relaxed);
-  PostStatus(L"searching minigame");
-  g_stopWorker.store(false);
-  g_running.store(true);
-  g_worker = std::thread([] {
-    WorkerLoop();
-    g_running.store(false);
-    PostMessageW(g_mainWnd, WM_APP_WORKER_DONE, 0, 0);
-  });
-}
-
-void StopWorker() {
-  if (!g_running.load()) return;
-  g_cursorVisible.store(false, std::memory_order_relaxed);
-  g_cursorInZone.store(false, std::memory_order_relaxed);
-  if (g_cursorWnd) ShowWindow(g_cursorWnd, SW_HIDE);
-  if (g_marksWnd) ShowWindow(g_marksWnd, SW_HIDE);
-  g_stopWorker.store(true);
-  if (g_worker.joinable()) {
-    if (std::this_thread::get_id() == g_worker.get_id()) return;
-    g_worker.join();
-  }
-  g_running.store(false);
-}
-
-LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-  switch (msg) {
-    case WM_CLOSE:
-      if (g_mainWnd && hwnd != g_mainWnd) {
-        PostMessageW(g_mainWnd, WM_CLOSE, 0, 0);
-        return 0;
-      }
-      return DefWindowProcW(hwnd, msg, wParam, lParam);
-    case WM_CREATE:
-      SetTimer(hwnd, 1, 100, nullptr);
-      return 0;
-    case WM_TIMER:
-      if (wParam == 1) {
-        if (g_listeningHotkey.load(std::memory_order_relaxed)) {
-          for (int vk = 8; vk <= 254; ++vk) {
-            if (!IsValidHotkeyVk(vk)) continue;
-            if (GetAsyncKeyState(vk) & 1) {
-              g_pendingHotkeyVk.store(vk, std::memory_order_relaxed);
-              break;
-            }
-          }
-        }
-        if (g_panelExpanded.load(std::memory_order_relaxed) &&
-            !g_hudDragging &&
-            !g_listeningHotkey.load(std::memory_order_relaxed) &&
-            g_lastHudInteractionTick != 0 &&
-            GetTickCount64() - g_lastHudInteractionTick >= kHudAutoCollapseMs) {
-          RECT wr{};
-          POINT cursor{};
-          if (GetWindowRect(hwnd, &wr) && GetCursorPos(&cursor) && !PtInRect(&wr, cursor)) {
-            CollapseHudPanel(hwnd);
-            return 0;
-          }
-        }
-        RequestOverlayRepaint();
-        return 0;
-      }
-      return 0;
-    case WM_NCHITTEST: {
-      RECT rc{};
-      GetClientRect(hwnd, &rc);
-      PreviewState state = SnapshotPreviewState();
-      RECT panel = HudPanelRect(state, rc);
-      if (!g_panelExpanded.load(std::memory_order_relaxed)) {
-        POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-        ScreenToClient(hwnd, &pt);
-        return PtInRect(&panel, pt) ? HTCLIENT : HTTRANSPARENT;
-      }
-      RECT exitButton = HudExitButtonRect(panel);
-      RECT collapseButton = HudCollapseButtonRect(panel);
-      RECT header = HudHeaderRect(panel);
-      RECT settingsToggle = HudSettingsToggleRect(panel);
-      RECT hotkeyBox = HudHotkeyRect(panel);
-      RECT confirmBox = HudConfirmRect(panel);
-      RECT overlayBox = HudOverlayCheckRect(panel);
-      RECT holdMinus = HudTapHoldMinusRect(panel);
-      RECT holdPlus = HudTapHoldPlusRect(panel);
-      RECT gapMinus = HudTapGapMinusRect(panel);
-      RECT gapPlus = HudTapGapPlusRect(panel);
-      POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-      ScreenToClient(hwnd, &pt);
-      const bool expanded = g_settingsExpanded.load(std::memory_order_relaxed);
-      return (PtInRect(&exitButton, pt) || PtInRect(&collapseButton, pt) || PtInRect(&header, pt) || PtInRect(&settingsToggle, pt) ||
-              (expanded && (PtInRect(&confirmBox, pt) || PtInRect(&overlayBox, pt) ||
-                            PtInRect(&holdMinus, pt) || PtInRect(&holdPlus, pt) ||
-                            PtInRect(&gapMinus, pt) || PtInRect(&gapPlus, pt))))
-                 ? HTCLIENT
-                 : HTTRANSPARENT;
-    }
-    case WM_LBUTTONDOWN: {
-      RECT rc{};
-      GetClientRect(hwnd, &rc);
-      PreviewState state = SnapshotPreviewState();
-      RECT panel = HudPanelRect(state, rc);
-      if (!g_panelExpanded.load(std::memory_order_relaxed)) {
-        ExpandHudPanel(hwnd);
-        return 0;
-      }
-      TouchHudInteraction();
-      RECT exitButton = HudExitButtonRect(panel);
-      RECT collapseButton = HudCollapseButtonRect(panel);
-      RECT header = HudHeaderRect(panel);
-      RECT settingsToggle = HudSettingsToggleRect(panel);
-      RECT hotkeyBox = HudHotkeyRect(panel);
-      RECT confirmBox = HudConfirmRect(panel);
-      RECT overlayBox = HudOverlayCheckRect(panel);
-      RECT holdMinus = HudTapHoldMinusRect(panel);
-      RECT holdPlus = HudTapHoldPlusRect(panel);
-      RECT gapMinus = HudTapGapMinusRect(panel);
-      RECT gapPlus = HudTapGapPlusRect(panel);
-      POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-      if (PtInRect(&collapseButton, pt)) {
-        CollapseHudPanel(hwnd);
-        return 0;
-      }
-      if (PtInRect(&settingsToggle, pt)) {
-        const bool expanded = !g_settingsExpanded.load(std::memory_order_relaxed);
-        g_settingsExpanded.store(expanded, std::memory_order_relaxed);
-        g_listeningHotkey.store(false, std::memory_order_relaxed);
-        ResizeHudToCurrent(hwnd);
-        RequestOverlayRepaint();
-        return 0;
-      }
-      if (g_settingsExpanded.load(std::memory_order_relaxed) && PtInRect(&confirmBox, pt)) {
-        if (!g_listeningHotkey.load(std::memory_order_relaxed)) {
-          g_pendingHotkeyVk.store(g_hotkeyVk.load(std::memory_order_relaxed), std::memory_order_relaxed);
-          g_listeningHotkey.store(true, std::memory_order_relaxed);
-        } else {
-          const int pending = g_pendingHotkeyVk.load(std::memory_order_relaxed);
-          if (IsValidHotkeyVk(pending)) {
-            g_hotkeyVk.store(pending, std::memory_order_relaxed);
-            ApplyHotkeySetting(g_mainWnd);
-            SaveSettings();
-          }
-          g_listeningHotkey.store(false, std::memory_order_relaxed);
-        }
-        RequestOverlayRepaint();
-        return 0;
-      }
-      if (g_settingsExpanded.load(std::memory_order_relaxed) && PtInRect(&overlayBox, pt)) {
-        const bool enabled = !g_overlayCursorEnabled.load(std::memory_order_relaxed);
-        g_overlayCursorEnabled.store(enabled, std::memory_order_relaxed);
-        if (!enabled && g_cursorWnd) ShowWindow(g_cursorWnd, SW_HIDE);
-        SaveSettings();
-        RequestOverlayRepaint();
-        return 0;
-      }
-      if (g_settingsExpanded.load(std::memory_order_relaxed) &&
-          (PtInRect(&holdMinus, pt) || PtInRect(&holdPlus, pt) || PtInRect(&gapMinus, pt) || PtInRect(&gapPlus, pt))) {
-        if (PtInRect(&holdMinus, pt)) {
-          g_tapHoldMs.store(ClampTapMs(g_tapHoldMs.load(std::memory_order_relaxed) - 1), std::memory_order_relaxed);
-        } else if (PtInRect(&holdPlus, pt)) {
-          g_tapHoldMs.store(ClampTapMs(g_tapHoldMs.load(std::memory_order_relaxed) + 1), std::memory_order_relaxed);
-        } else if (PtInRect(&gapMinus, pt)) {
-          g_tapGapMs.store(ClampTapMs(g_tapGapMs.load(std::memory_order_relaxed) - 1), std::memory_order_relaxed);
-        } else if (PtInRect(&gapPlus, pt)) {
-          g_tapGapMs.store(ClampTapMs(g_tapGapMs.load(std::memory_order_relaxed) + 1), std::memory_order_relaxed);
-        }
-        SaveSettings();
-        RequestOverlayRepaint();
-        return 0;
-      }
-      if (PtInRect(&header, pt) && !PtInRect(&exitButton, pt)) {
-        g_hudDragging = true;
-        g_hudDragOffset = POINT{pt.x - panel.left, pt.y - panel.top};
-        SetCapture(hwnd);
-        return 0;
-      }
-      return 0;
-    }
-    case WM_MOUSEMOVE: {
-      if (g_panelExpanded.load(std::memory_order_relaxed)) TouchHudInteraction();
-      if (g_hudDragging) {
-        POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-        ClientToScreen(hwnd, &pt);
-        RECT desired{pt.x - g_hudDragOffset.x, pt.y - g_hudDragOffset.y,
-                     pt.x - g_hudDragOffset.x + CurrentHudWidth(), pt.y - g_hudDragOffset.y + CurrentHudHeight()};
-        RECT clamped = ClampHudScreenRect(desired);
-        g_hudUserPlaced = true;
-        g_hudPos = POINT{clamped.left, clamped.top};
-        SetWindowPos(hwnd, HWND_TOPMOST, clamped.left, clamped.top, CurrentHudWidth(), CurrentHudHeight(),
-                     SWP_NOACTIVATE | SWP_NOOWNERZORDER);
-        return 0;
-      }
-      return 0;
-    }
-    case WM_LBUTTONUP: {
-      if (g_hudDragging) {
-        g_hudDragging = false;
-        ReleaseCapture();
-        return 0;
-      }
-      RECT rc{};
-      GetClientRect(hwnd, &rc);
-      PreviewState state = SnapshotPreviewState();
-      RECT panel = HudPanelRect(state, rc);
-      if (!g_panelExpanded.load(std::memory_order_relaxed)) return 0;
-      RECT exitButton = HudExitButtonRect(panel);
-      POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-      if (PtInRect(&exitButton, pt)) {
-        if (g_mainWnd) PostMessageW(g_mainWnd, WM_CLOSE, 0, 0);
-        return 0;
-      }
-      return 0;
-    }
-    case WM_ERASEBKGND:
-      return 1;
-    case WM_PAINT: {
-      g_overlayRepaintPending.store(false);
-      PAINTSTRUCT ps{};
-      HDC hdc = BeginPaint(hwnd, &ps);
-      RECT rc{};
-      GetClientRect(hwnd, &rc);
-      HBRUSH clearBrush = CreateSolidBrush(RGB(0, 0, 0));
-      FillRect(hdc, &rc, clearBrush);
-      DeleteObject(clearBrush);
-
-      PreviewState state = SnapshotPreviewState();
-
-      SetBkMode(hdc, TRANSPARENT);
-      HPEN redPen = CreatePen(PS_SOLID, 2, RGB(70, 255, 120));
-      HBRUSH panelBrush = CreateSolidBrush(RGB(10, 14, 20));
-      HBRUSH panelHeaderBrush = CreateSolidBrush(RGB(18, 28, 42));
-      HBRUSH runningBrush = CreateSolidBrush(RGB(255, 150, 45));
-      HBRUSH readyBrush = CreateSolidBrush(RGB(80, 255, 140));
-      HBRUSH dimPillBrush = CreateSolidBrush(RGB(30, 42, 54));
-      HPEN closePen = CreatePen(PS_SOLID, 2, RGB(255, 120, 120));
-      HBRUSH closeBrush = CreateSolidBrush(RGB(42, 20, 26));
-      HBRUSH confirmBrush = CreateSolidBrush(RGB(22, 48, 44));
-      HGDIOBJ oldPen = SelectObject(hdc, redPen);
-      HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(HOLLOW_BRUSH));
-
-      HFONT font = CreateFontW(18, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                               OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
-                               DEFAULT_PITCH | FF_DONTCARE, L"Consolas");
-      HGDIOBJ oldFont = SelectObject(hdc, font);
-
-      RECT panel = HudPanelRect(state, rc);
-      const int px = panel.left;
-      const int py = panel.top;
-      const bool isRunning = g_running.load(std::memory_order_relaxed);
-      if (!g_panelExpanded.load(std::memory_order_relaxed)) {
-        SelectObject(hdc, panelBrush);
-        SelectObject(hdc, redPen);
-        RoundRect(hdc, panel.left, panel.top, panel.right, panel.bottom, 18, 18);
-
-        RECT led{px + 14, py + 15, px + 26, py + 27};
-        SelectObject(hdc, isRunning ? runningBrush : readyBrush);
-        SelectObject(hdc, GetStockObject(NULL_PEN));
-        Ellipse(hdc, led.left, led.top, led.right, led.bottom);
-
-        const wchar_t* stateTitle = isRunning ? L"RUNNING" : L"READY";
-        SetTextColor(hdc, isRunning ? RGB(255, 170, 70) : RGB(145, 255, 175));
-        TextOutW(hdc, px + 36, py + 7, stateTitle, static_cast<int>(wcslen(stateTitle)));
-
-        std::wstring status = state.status.empty() ? L"idle" : state.status;
-        SetTextColor(hdc, RGB(210, 220, 230));
-        TextOutW(hdc, px + 104, py + 8, status.c_str(), static_cast<int>(std::min<size_t>(status.size(), 14)));
-      } else {
-      RECT exitButton = HudExitButtonRect(panel);
-      RECT collapseButton = HudCollapseButtonRect(panel);
-      RECT hotkeyBox = HudHotkeyRect(panel);
-      RECT confirmBox = HudConfirmRect(panel);
-      RECT overlayBox = HudOverlayCheckRect(panel);
-      RECT holdMinus = HudTapHoldMinusRect(panel);
-      RECT holdValue = HudTapHoldValueRect(panel);
-      RECT holdPlus = HudTapHoldPlusRect(panel);
-      RECT gapMinus = HudTapGapMinusRect(panel);
-      RECT gapValue = HudTapGapValueRect(panel);
-      RECT gapPlus = HudTapGapPlusRect(panel);
-      SelectObject(hdc, panelBrush);
-      RoundRect(hdc, panel.left, panel.top, panel.right, panel.bottom, 14, 14);
-      SelectObject(hdc, panelHeaderBrush);
-      RoundRect(hdc, panel.left, panel.top, panel.right, panel.top + 42, 14, 14);
-      SelectObject(hdc, GetStockObject(HOLLOW_BRUSH));
-      SelectObject(hdc, redPen);
-      RoundRect(hdc, panel.left, panel.top, panel.right, panel.bottom, 14, 14);
-
-      RECT led{px + 14, py + 13, px + 26, py + 25};
-      SelectObject(hdc, isRunning ? runningBrush : readyBrush);
-      Ellipse(hdc, led.left, led.top, led.right, led.bottom);
-
-      const wchar_t* stateTitle = isRunning ? L"RUNNING" : L"READY";
-      SetTextColor(hdc, isRunning ? RGB(255, 170, 70) : RGB(145, 255, 175));
-      TextOutW(hdc, px + 36, py + 7, stateTitle, static_cast<int>(wcslen(stateTitle)));
-      const std::wstring prompt = L"Hotkey " + KeyName(g_hotkeyVk.load(std::memory_order_relaxed));
-      SetTextColor(hdc, RGB(210, 220, 230));
-      TextOutW(hdc, px + 122, py + 8, prompt.c_str(), static_cast<int>(std::min<size_t>(prompt.size(), 12)));
-
-      SelectObject(hdc, dimPillBrush);
-      SelectObject(hdc, redPen);
-      RoundRect(hdc, collapseButton.left, collapseButton.top, collapseButton.right, collapseButton.bottom, 8, 8);
-      MoveToEx(hdc, collapseButton.left + 6, collapseButton.top + 11, nullptr);
-      LineTo(hdc, collapseButton.right - 6, collapseButton.top + 11);
-
-      SelectObject(hdc, closeBrush);
-      SelectObject(hdc, closePen);
-      RoundRect(hdc, exitButton.left, exitButton.top, exitButton.right, exitButton.bottom, 8, 8);
-      MoveToEx(hdc, exitButton.left + 7, exitButton.top + 7, nullptr);
-      LineTo(hdc, exitButton.right - 7, exitButton.bottom - 7);
-      MoveToEx(hdc, exitButton.right - 7, exitButton.top + 7, nullptr);
-      LineTo(hdc, exitButton.left + 7, exitButton.bottom - 7);
-
-      SetTextColor(hdc, RGB(145, 155, 170));
-      TextOutW(hdc, px + 14, py + 54, state.status.c_str(), static_cast<int>(std::min<size_t>(state.status.size(), 48)));
-
-      const bool listening = g_listeningHotkey.load(std::memory_order_relaxed);
-      const bool settingsExpanded = g_settingsExpanded.load(std::memory_order_relaxed);
-      RECT settingsToggle = HudSettingsToggleRect(panel);
-      SetTextColor(hdc, RGB(120, 135, 150));
-      TextOutW(hdc, px + 14, py + 84, L"SETTINGS", 8);
-      POINT tri[3]{};
-      if (settingsExpanded) {
-        tri[0] = POINT{settingsToggle.left + 5, settingsToggle.top + 7};
-        tri[1] = POINT{settingsToggle.right - 5, settingsToggle.top + 7};
-        tri[2] = POINT{(settingsToggle.left + settingsToggle.right) / 2, settingsToggle.bottom - 5};
-      } else {
-        tri[0] = POINT{settingsToggle.left + 7, settingsToggle.top + 4};
-        tri[1] = POINT{settingsToggle.left + 7, settingsToggle.bottom - 4};
-        tri[2] = POINT{settingsToggle.right - 5, (settingsToggle.top + settingsToggle.bottom) / 2};
-      }
-      SelectObject(hdc, readyBrush);
-      SelectObject(hdc, GetStockObject(NULL_PEN));
-      Polygon(hdc, tri, 3);
-
-      if (settingsExpanded) {
-        SetTextColor(hdc, RGB(180, 195, 210));
-        TextOutW(hdc, px + 14, py + 118, L"Hotkey", 6);
-        SelectObject(hdc, GetStockObject(HOLLOW_BRUSH));
-        SelectObject(hdc, redPen);
-        RoundRect(hdc, hotkeyBox.left, hotkeyBox.top, hotkeyBox.right, hotkeyBox.bottom, 7, 7);
-        const std::wstring hotkeyText = listening ? KeyName(g_pendingHotkeyVk.load(std::memory_order_relaxed))
-                                                  : KeyName(g_hotkeyVk.load(std::memory_order_relaxed));
-        SetTextColor(hdc, listening ? RGB(255, 210, 90) : RGB(225, 235, 245));
-        TextOutW(hdc, hotkeyBox.left + 10, hotkeyBox.top + 6, hotkeyText.c_str(), static_cast<int>(std::min<size_t>(hotkeyText.size(), 10)));
-
-        SelectObject(hdc, confirmBrush);
-        SelectObject(hdc, redPen);
-        RoundRect(hdc, confirmBox.left, confirmBox.top, confirmBox.right, confirmBox.bottom, 7, 7);
-        const wchar_t* buttonText = listening ? L"OK" : L"Change";
-        SetTextColor(hdc, RGB(145, 255, 175));
-        TextOutW(hdc, confirmBox.left + (listening ? 24 : 12), confirmBox.top + 6, buttonText, static_cast<int>(wcslen(buttonText)));
-
-        const bool cursorEnabled = g_overlayCursorEnabled.load(std::memory_order_relaxed);
-        SelectObject(hdc, cursorEnabled ? readyBrush : dimPillBrush);
-        SelectObject(hdc, redPen);
-        Rectangle(hdc, overlayBox.left, overlayBox.top, overlayBox.right, overlayBox.bottom);
-        if (cursorEnabled) {
-          MoveToEx(hdc, overlayBox.left + 4, overlayBox.top + 9, nullptr);
-          LineTo(hdc, overlayBox.left + 8, overlayBox.bottom - 4);
-          LineTo(hdc, overlayBox.right - 4, overlayBox.top + 4);
-        }
-        SetTextColor(hdc, RGB(180, 195, 210));
-        TextOutW(hdc, px + 46, py + 150, L"Overlay cursor", 14);
-
-        SetTextColor(hdc, RGB(120, 135, 150));
-        TextOutW(hdc, px + 14, py + 178, L"AUTO KEY", 8);
-        SetTextColor(hdc, RGB(180, 195, 210));
-        TextOutW(hdc, px + 14, py + 195, L"Press duration", 14);
-        TextOutW(hdc, px + 14, py + 225, L"Press interval", 14);
-
-        auto drawTimingButton = [&](RECT r, const wchar_t* text) {
-          SelectObject(hdc, confirmBrush);
-          SelectObject(hdc, redPen);
-          RoundRect(hdc, r.left, r.top, r.right, r.bottom, 6, 6);
-          SetTextColor(hdc, RGB(145, 255, 175));
-          TextOutW(hdc, r.left + 7, r.top + 4, text, static_cast<int>(wcslen(text)));
-        };
-        auto drawTimingValue = [&](RECT r, int value) {
-          SelectObject(hdc, GetStockObject(HOLLOW_BRUSH));
-          SelectObject(hdc, redPen);
-          RoundRect(hdc, r.left, r.top, r.right, r.bottom, 6, 6);
-          std::wstring text = std::to_wstring(value);
-          SetTextColor(hdc, RGB(225, 235, 245));
-          TextOutW(hdc, r.left + 8, r.top + 4, text.c_str(), static_cast<int>(text.size()));
-        };
-        drawTimingButton(holdMinus, L"-");
-        drawTimingValue(holdValue, g_tapHoldMs.load(std::memory_order_relaxed));
-        drawTimingButton(holdPlus, L"+");
-        SetTextColor(hdc, RGB(180, 195, 210));
-        TextOutW(hdc, px + 260, py + 195, L"ms", 2);
-        drawTimingButton(gapMinus, L"-");
-        drawTimingValue(gapValue, g_tapGapMs.load(std::memory_order_relaxed));
-        drawTimingButton(gapPlus, L"+");
-        SetTextColor(hdc, RGB(180, 195, 210));
-        TextOutW(hdc, px + 260, py + 225, L"ms", 2);
-      }
-      }
-
-      SelectObject(hdc, oldFont);
-      SelectObject(hdc, oldBrush);
-      SelectObject(hdc, oldPen);
-      DeleteObject(font);
-      DeleteObject(redPen);
-      DeleteObject(panelBrush);
-      DeleteObject(panelHeaderBrush);
-      DeleteObject(runningBrush);
-      DeleteObject(readyBrush);
-      DeleteObject(dimPillBrush);
-      DeleteObject(confirmBrush);
-      DeleteObject(closePen);
-      DeleteObject(closeBrush);
-      EndPaint(hwnd, &ps);
-      return 0;
-    }
-    default:
-      return DefWindowProcW(hwnd, msg, wParam, lParam);
-  }
-}
-
 LRESULT CALLBACK MarksProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
   switch (msg) {
     case WM_CREATE:
@@ -1972,8 +1202,8 @@ LRESULT CALLBACK MarksProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_TIMER: {
       if (wParam != 1) return 0;
       PreviewState state = SnapshotPreviewState();
-      if (!g_overlayCursorEnabled.load(std::memory_order_relaxed) ||
-          !g_running.load(std::memory_order_relaxed) || state.bars.empty()) {
+      if (!gta5::app::ui::OverlayEnabled() ||
+          !gta5::app::runtime::Running() || state.bars.empty()) {
         ShowWindow(hwnd, SW_HIDE);
         return 0;
       }
@@ -1993,7 +1223,7 @@ LRESULT CALLBACK MarksProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
       const int markerScreenY = state.red.centerY;
       RECT desired{std::min(infoRight - infoW, minX) - pad, markerScreenY - infoH / 2 - pad,
                    std::max(infoRight, maxX) + pad, markerScreenY + infoH / 2 + pad};
-      RECT clamped = ClampHudScreenRect(desired);
+      RECT clamped = ClampOverlayScreenRect(desired);
       SetWindowPos(hwnd, HWND_TOPMOST, clamped.left, clamped.top, clamped.right - clamped.left, clamped.bottom - clamped.top,
                    SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
       InvalidateRect(hwnd, nullptr, FALSE);
@@ -2014,8 +1244,8 @@ LRESULT CALLBACK MarksProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
       DeleteObject(clearBrush);
 
       PreviewState state = SnapshotPreviewState();
-      if (!g_overlayCursorEnabled.load(std::memory_order_relaxed) ||
-          !g_running.load(std::memory_order_relaxed) || state.bars.empty()) {
+      if (!gta5::app::ui::OverlayEnabled() ||
+          !gta5::app::runtime::Running() || state.bars.empty()) {
         EndPaint(hwnd, &ps);
         return 0;
       }
@@ -2027,14 +1257,14 @@ LRESULT CALLBACK MarksProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
                                DEFAULT_PITCH | FF_DONTCARE, L"Consolas");
       HGDIOBJ oldFont = SelectObject(hdc, font);
-      HPEN glowPen = CreatePen(PS_SOLID, 4, RGB(18, 66, 50));
-      HPEN activePen = CreatePen(PS_SOLID, 2, RGB(112, 255, 198));
-      HPEN donePen = CreatePen(PS_SOLID, 2, RGB(82, 160, 220));
-      HPEN dimPen = CreatePen(PS_SOLID, 2, RGB(58, 70, 84));
-      HBRUSH activeBrush = CreateSolidBrush(RGB(112, 255, 198));
-      HBRUSH doneBrush = CreateSolidBrush(RGB(50, 112, 158));
-      HBRUSH dimBrush = CreateSolidBrush(RGB(28, 38, 50));
-      HBRUSH infoBrush = CreateSolidBrush(RGB(8, 14, 18));
+      HPEN glowPen = CreatePen(PS_SOLID, 4, kOverlayBlack);
+      HPEN activePen = CreatePen(PS_SOLID, 2, kOverlayGreen);
+      HPEN donePen = CreatePen(PS_SOLID, 2, kOverlayGreen);
+      HPEN dimPen = CreatePen(PS_SOLID, 2, kOverlayDeepGreen);
+      HBRUSH activeBrush = CreateSolidBrush(kOverlayBrightGreen);
+      HBRUSH doneBrush = CreateSolidBrush(kOverlayDeepGreen);
+      HBRUSH dimBrush = CreateSolidBrush(kOverlayBlack);
+      HBRUSH infoBrush = CreateSolidBrush(kOverlayBlack);
       HGDIOBJ oldPen = SelectObject(hdc, glowPen);
       HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(HOLLOW_BRUSH));
 
@@ -2075,7 +1305,7 @@ LRESULT CALLBACK MarksProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
       SelectObject(hdc, infoBrush);
       SelectObject(hdc, activePen);
       RoundRect(hdc, info.left, info.top, info.right, info.bottom, 8, 8);
-      SetTextColor(hdc, RGB(180, 255, 218));
+      SetTextColor(hdc, kOverlayTextGreen);
       const int textX = info.left + ScaledPx(8, state.scale);
       TextOutW(hdc, textX, info.top + ScaledPx(5, state.scale), dtText.c_str(), static_cast<int>(dtText.size()));
       TextOutW(hdc, textX, info.top + ScaledPx(23, state.scale), ttcText.c_str(), static_cast<int>(ttcText.size()));
@@ -2107,9 +1337,9 @@ LRESULT CALLBACK CursorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
       return 0;
     case WM_TIMER: {
       if (wParam != 1) return 0;
-      if (!g_overlayCursorEnabled.load(std::memory_order_relaxed) ||
+      if (!gta5::app::ui::OverlayEnabled() ||
           !g_cursorVisible.load(std::memory_order_relaxed) ||
-          !g_running.load(std::memory_order_relaxed)) {
+          !gta5::app::runtime::Running()) {
         ShowWindow(hwnd, SW_HIDE);
         return 0;
       }
@@ -2122,7 +1352,7 @@ LRESULT CALLBACK CursorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
       const int bottom = inZone ? std::max(cursorY + kCursorSize / 2, targetY + 10) : cursorY + kCursorSize / 2;
       const int x = cursorX - kCursorSize / 2;
       RECT desired{x, top, x + kCursorSize, bottom};
-      RECT clamped = ClampHudScreenRect(desired);
+      RECT clamped = ClampOverlayScreenRect(desired);
       SetWindowPos(hwnd, HWND_TOPMOST, clamped.left, clamped.top, kCursorSize, clamped.bottom - clamped.top,
                    SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
       InvalidateRect(hwnd, nullptr, FALSE);
@@ -2142,10 +1372,10 @@ LRESULT CALLBACK CursorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
       DeleteObject(clearBrush);
 
       SetBkMode(hdc, TRANSPARENT);
-      HPEN glowPen = CreatePen(PS_SOLID, 8, RGB(20, 70, 18));
-      HPEN arrowPen = CreatePen(PS_SOLID, 5, RGB(72, 255, 36));
-      HPEN linkGlowPen = CreatePen(PS_SOLID, 5, RGB(16, 62, 22));
-      HPEN linkPen = CreatePen(PS_SOLID, 2, RGB(72, 255, 36));
+      HPEN glowPen = CreatePen(PS_SOLID, 8, kOverlayBlack);
+      HPEN arrowPen = CreatePen(PS_SOLID, 5, kOverlayGreen);
+      HPEN linkGlowPen = CreatePen(PS_SOLID, 5, kOverlayBlack);
+      HPEN linkPen = CreatePen(PS_SOLID, 2, kOverlayGreen);
       HGDIOBJ oldPen = SelectObject(hdc, glowPen);
       HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(HOLLOW_BRUSH));
 
@@ -2205,112 +1435,13 @@ LRESULT CALLBACK CursorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
   }
 }
 
-LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-  switch (msg) {
-    case WM_CREATE:
-      ApplyHotkeySetting(hwnd);
-      return 0;
-    case WM_HOTKEY:
-      if (wParam == kHotkeyToggleId) {
-        if (g_listeningHotkey.load(std::memory_order_relaxed)) return 0;
-        if (g_running.load()) {
-          StopWorker();
-        } else {
-          StartWorker();
-        }
-        return 0;
-      }
-      return 0;
-    case WM_APP_LOG: {
-      std::unique_ptr<std::wstring> text(reinterpret_cast<std::wstring*>(lParam));
-      OutputDebugStringW(text->c_str());
-      OutputDebugStringW(L"\n");
-      {
-        std::lock_guard<std::mutex> lock(g_previewMutex);
-        g_preview.lastLog = *text;
-        g_preview.running = g_running.load();
-      }
-      RequestOverlayRepaint();
-      return 0;
-    }
-    case WM_APP_STATUS: {
-      std::unique_ptr<std::wstring> text(reinterpret_cast<std::wstring*>(lParam));
-      {
-        std::lock_guard<std::mutex> lock(g_previewMutex);
-        g_preview.status = *text;
-        g_preview.running = g_running.load();
-      }
-      RequestOverlayRepaint();
-      return 0;
-    }
-    case WM_APP_WORKER_DONE:
-      {
-        std::lock_guard<std::mutex> lock(g_previewMutex);
-        g_preview.running = false;
-      }
-      RequestOverlayRepaint();
-      if (g_worker.joinable()) g_worker.detach();
-      return 0;
-    case WM_CLOSE:
-      StopWorker();
-      if (g_marksWnd) DestroyWindow(g_marksWnd);
-      if (g_cursorWnd) DestroyWindow(g_cursorWnd);
-      if (g_overlayWnd) DestroyWindow(g_overlayWnd);
-      DestroyWindow(hwnd);
-      return 0;
-    case WM_DESTROY:
-      StopWorker();
-      UnregisterHotKey(hwnd, kHotkeyToggleId);
-      PostQuitMessage(0);
-      return 0;
-    default:
-      return DefWindowProcW(hwnd, msg, wParam, lParam);
-  }
-}
-
 }  // namespace
 
 void SetHostWindow(HWND hwnd) { g_mainWnd = hwnd; }
-HWND HudWindow() { return g_overlayWnd; }
 HWND CursorWindow() { return g_cursorWnd; }
 HWND MarksWindow() { return g_marksWnd; }
-void SetHudWindow(HWND hwnd) { g_overlayWnd = hwnd; }
 void SetCursorWindow(HWND hwnd) { g_cursorWnd = hwnd; }
 void SetMarksWindow(HWND hwnd) { g_marksWnd = hwnd; }
-bool OverlayEnabled() { return g_overlayCursorEnabled.load(std::memory_order_relaxed); }
-void SetOverlayEnabled(bool enabled) { g_overlayCursorEnabled.store(enabled, std::memory_order_relaxed); SaveSettings(); }
-int TapHoldMs() { return g_tapHoldMs.load(std::memory_order_relaxed); }
-int TapGapMs() { return g_tapGapMs.load(std::memory_order_relaxed); }
-int HotkeyVk() { return g_hotkeyVk.load(std::memory_order_relaxed); }
-std::wstring HotkeyName() { return KeyName(HotkeyVk()); }
-void LoadPersistentSettings() { LoadSettings(); }
-void ApplyHotkey(HWND hwnd) { ApplyHotkeySetting(hwnd); }
-bool Running() { return g_running.load(std::memory_order_relaxed); }
-void RequestStop() { g_stopWorker.store(true, std::memory_order_relaxed); }
-void MarkRunning(bool running) {
-  g_running.store(running, std::memory_order_relaxed);
-  if (running) {
-    g_panelExpanded.store(false, std::memory_order_relaxed);
-    g_settingsExpanded.store(false, std::memory_order_relaxed);
-    g_listeningHotkey.store(false, std::memory_order_relaxed);
-    if (g_overlayWnd) {
-      RECT wr{};
-      GetWindowRect(g_overlayWnd, &wr);
-      RECT desired{wr.left, wr.top, wr.left + CurrentHudWidth(), wr.top + CurrentHudHeight()};
-      RECT clamped = ClampHudScreenRect(desired);
-      g_hudPos = POINT{clamped.left, clamped.top};
-      g_hudUserPlaced = true;
-      SetWindowPos(g_overlayWnd, HWND_TOPMOST, clamped.left, clamped.top, CurrentHudWidth(), CurrentHudHeight(),
-                   SWP_NOACTIVATE | SWP_NOOWNERZORDER);
-    }
-  }
-}
-void ResetStopFlag() { g_stopWorker.store(false, std::memory_order_relaxed); }
-bool StopRequested() { return g_stopWorker.load(std::memory_order_relaxed); }
-std::thread& WorkerThread() { return g_worker; }
-void PostModuleLog(const std::wstring& text) { PostLog(text); }
-void PostModuleStatus(const std::wstring& text) { PostStatus(text); }
-void RepaintHud() { RequestOverlayRepaint(); }
 void ClearOverlayState() {
   g_cursorVisible.store(false, std::memory_order_relaxed);
   g_cursorInZone.store(false, std::memory_order_relaxed);
@@ -2324,25 +1455,16 @@ void ClearOverlayState() {
     g_preview = PreviewState{};
     g_preview.status = status;
     g_preview.lastLog = lastLog;
-    g_preview.running = g_running.load(std::memory_order_relaxed);
+    g_preview.running = gta5::app::runtime::Running();
   }
   if (g_cursorWnd) ShowWindow(g_cursorWnd, SW_HIDE);
   if (g_marksWnd) ShowWindow(g_marksWnd, SW_HIDE);
-  RequestOverlayRepaint();
+  RequestMarksRepaint();
 }
 void HideTransientOverlays() { ClearOverlayState(); }
 bool DetectInGame() { CaptureFrame frame; if (!CaptureScreenRegion(frame, nullptr)) return false; return AnalyzeFrame(frame).inMinigame; }
 void RunSession() { WorkerLoop(); ClearOverlayState(); }
-RECT InitialHudRect() { return InitialHudScreenRect(); }
-int HudWidth() { return CurrentHudWidth(); }
-int HudHeight() { return CurrentHudHeight(); }
 int CursorSize() { return kCursorSize; }
-int HotkeyId() { return kHotkeyToggleId; }
-bool IsListeningHotkey() { return g_listeningHotkey.load(std::memory_order_relaxed); }
-void UpdatePreviewRunning(bool running) { std::lock_guard<std::mutex> lock(g_previewMutex); g_preview.running = running; }
-void SetHudLogText(const std::wstring& text) { std::lock_guard<std::mutex> lock(g_previewMutex); g_preview.lastLog = text; g_preview.running = g_running.load(std::memory_order_relaxed); }
-void SetHudStatusText(const std::wstring& text) { std::lock_guard<std::mutex> lock(g_previewMutex); g_preview.status = text; g_preview.running = g_running.load(std::memory_order_relaxed); }
-LRESULT CALLBACK HudProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) { return OverlayProc(hwnd, msg, wParam, lParam); }
 LRESULT CALLBACK CursorWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) { return CursorProc(hwnd, msg, wParam, lParam); }
 LRESULT CALLBACK MarksWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) { return MarksProc(hwnd, msg, wParam, lParam); }
 

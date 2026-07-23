@@ -9,6 +9,7 @@
 #include <dwmapi.h>
 #include <commctrl.h>
 #include "games.h"
+#include "../app/app_ui.h"
 #include "../capture/game_window.h"
 #include <algorithm>
 #include <array>
@@ -31,6 +32,7 @@ static const UINT TIMER_ID = 1001;
 static const UINT TIMER_MS = 16;
 static const int kMinigameCheckIntervalFrames = 10;
 static const int kSelectedStableFramesBeforeInput = 2;
+static const int kLevelFocusHideAfterMissFrames = 5;
 struct Pattern {
     std::array<int, GRID_CELLS> on{};
 
@@ -144,6 +146,8 @@ struct AppState {
     int observedLevelSlot = 0;
     int observedLevelStableFrames = 0;
     bool levelFocusVisible = false;
+    bool levelFocusDetectedThisFrame = false;
+    int levelFocusMissFrames = 0;
     UiRect levelFocus{};
     DWORD64 nextInputAt = 0;
     bool autoInputEnabled = false;
@@ -810,7 +814,10 @@ static int DetectLevelSlotFromShot(const ScreenShot& shot, UiRect* focusScreen =
 static int DetectLevelSlot() {
     ScreenShot shot;
     if (!CaptureScreen(shot)) {
-        g.levelFocusVisible = false;
+        g.levelFocusDetectedThisFrame = false;
+        if (++g.levelFocusMissFrames >= kLevelFocusHideAfterMissFrames) {
+            g.levelFocusVisible = false;
+        }
         return 0;
     }
 
@@ -819,8 +826,13 @@ static int DetectLevelSlot() {
     if (slot > 0) {
         g.levelFocus = focus;
         g.levelFocusVisible = true;
+        g.levelFocusDetectedThisFrame = true;
+        g.levelFocusMissFrames = 0;
     } else {
-        g.levelFocusVisible = false;
+        g.levelFocusDetectedThisFrame = false;
+        if (++g.levelFocusMissFrames >= kLevelFocusHideAfterMissFrames) {
+            g.levelFocusVisible = false;
+        }
     }
     return slot;
 }
@@ -828,6 +840,9 @@ static int DetectLevelSlot() {
 static bool UpdateObservedLevelSlot(int detectedSlot, bool* changed = nullptr, bool initialIsChange = false) {
     if (changed) *changed = false;
     if (detectedSlot <= 0) {
+        if (g.levelFocusMissFrames < kLevelFocusHideAfterMissFrames) {
+            return g.observedLevelStableFrames >= 2;
+        }
         g.observedLevelSlot = 0;
         g.observedLevelStableFrames = 0;
         return false;
@@ -1022,7 +1037,7 @@ static void PressScanCode(WORD scanCode, bool extended = false) {
     input.ki.wScan = scanCode;
     input.ki.dwFlags = KEYEVENTF_SCANCODE | (extended ? KEYEVENTF_EXTENDEDKEY : 0);
     SendInput(1, &input, sizeof(INPUT));
-    Sleep((DWORD)gta5::games::slider::TapHoldMs());
+    Sleep((DWORD)gta5::app::ui::TapHoldMs());
 
     input.ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP | (extended ? KEYEVENTF_EXTENDEDKEY : 0);
     SendInput(1, &input, sizeof(INPUT));
@@ -1146,10 +1161,10 @@ static void TickAutoInput() {
     g.autoMessage = L"Sending column";
     for (WORD key : keys) {
         PressGameKey(key);
-        Sleep((DWORD)gta5::games::slider::TapGapMs());
+        Sleep((DWORD)gta5::app::ui::TapGapMs());
     }
     DWORD settleMs = static_cast<DWORD>(keys.size()) *
-        ((DWORD)gta5::games::slider::TapHoldMs() + (DWORD)gta5::games::slider::TapGapMs());
+        ((DWORD)gta5::app::ui::TapHoldMs() + (DWORD)gta5::app::ui::TapGapMs());
     g.nextInputAt = GetTickCount64() + settleMs + 120;
 
     g.pendingVerifyCol = selectedCol;
@@ -1186,6 +1201,8 @@ static void ClearRuntimeState(const wchar_t* reason) {
     g.observedLevelSlot = 0;
     g.observedLevelStableFrames = 0;
     g.levelFocusVisible = false;
+    g.levelFocusDetectedThisFrame = false;
+    g.levelFocusMissFrames = 0;
     g.levelFocus = UiRect{};
     if (wcscmp(reason, L"Not in minigame") == 0) {
         g.minigameVisible = false;
@@ -1237,9 +1254,20 @@ static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 1;
     case WM_PAINT: {
         PAINTSTRUCT ps;
-        HDC hdc = BeginPaint(hwnd, &ps);
+        HDC paintDc = BeginPaint(hwnd, &ps);
         RECT rc;
         GetClientRect(hwnd, &rc);
+        HDC hdc = CreateCompatibleDC(paintDc);
+        HBITMAP buffer = CreateCompatibleBitmap(paintDc, rc.right - rc.left, rc.bottom - rc.top);
+        HGDIOBJ oldBitmap = SelectObject(hdc, buffer);
+        auto present = [&] {
+            SetViewportOrgEx(hdc, 0, 0, nullptr);
+            BitBlt(paintDc, 0, 0, rc.right - rc.left, rc.bottom - rc.top, hdc, 0, 0, SRCCOPY);
+            SelectObject(hdc, oldBitmap);
+            DeleteObject(buffer);
+            DeleteDC(hdc);
+            EndPaint(hwnd, &ps);
+        };
         HBRUSH bg = CreateSolidBrush(RGB(0, 0, 0));
         FillRect(hdc, &rc, bg);
         DeleteObject(bg);
@@ -1249,7 +1277,7 @@ static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         SetBkMode(hdc, TRANSPARENT);
         if (!g.running || !g.minigameVisible || !g.circlesReady) {
-            EndPaint(hwnd, &ps);
+            present();
             return 0;
         }
 
@@ -1333,8 +1361,9 @@ static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 { cx - halfW, top },
                 { cx + halfW, top }
             };
-            HBRUSH brush = CreateSolidBrush(RGB(0, 245, 95));
-            HPEN pen = CreatePen(PS_SOLID, ScalePx(1, screenH), RGB(0, 255, 120));
+            const COLORREF focusColor = g.levelFocusDetectedThisFrame ? RGB(0, 245, 95) : RGB(255, 190, 45);
+            HBRUSH brush = CreateSolidBrush(focusColor);
+            HPEN pen = CreatePen(PS_SOLID, ScalePx(1, screenH), focusColor);
             SelectObject(hdc, brush);
             SelectObject(hdc, pen);
             Polygon(hdc, tri, 3);
@@ -1344,7 +1373,7 @@ static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             DeleteObject(brush);
             DeleteObject(shadowBrush);
         }
-        EndPaint(hwnd, &ps);
+        present();
         return 0;
     }
     }
@@ -1476,6 +1505,8 @@ static void ResetHistory() {
     g.observedLevelSlot = 0;
     g.observedLevelStableFrames = 0;
     g.levelFocusVisible = false;
+    g.levelFocusDetectedThisFrame = false;
+    g.levelFocusMissFrames = 0;
     g.levelFocus = UiRect{};
     g.nextInputAt = 0;
     g.autoInputEnabled = false;

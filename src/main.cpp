@@ -9,13 +9,14 @@
 #include <windows.h>
 #include <propidl.h>
 
-#include <atomic>
 #include <chrono>
 #include <memory>
 #include <string>
 #include <thread>
 
 #include "games/games.h"
+#include "app/app_ui.h"
+#include "app/app_runtime.h"
 #include "capture/game_window.h"
 #include "resources/resource.h"
 
@@ -52,10 +53,6 @@ std::wstring GameName(GameKind game) {
   }
 }
 
-bool OverlayEnabled() {
-  return gta5::games::slider::OverlayEnabled();
-}
-
 void HideAllGameOverlays() {
   gta5::games::slider::HideTransientOverlays();
   gta5::games::flashing::HideOverlay();
@@ -72,11 +69,15 @@ GameKind DetectGame() {
 }
 
 void PostStatus(const std::wstring& text) {
-  gta5::games::slider::PostModuleStatus(text);
+  auto* payload = new std::wstring(text);
+  if (g_host) PostMessageW(g_host, kMsgStatus, 0, reinterpret_cast<LPARAM>(payload));
+  else delete payload;
 }
 
 void PostLog(const std::wstring& text) {
-  gta5::games::slider::PostModuleLog(text);
+  auto* payload = new std::wstring(text);
+  if (g_host) PostMessageW(g_host, kMsgLog, 0, reinterpret_cast<LPARAM>(payload));
+  else delete payload;
 }
 
 HICON LoadAppIcon(HINSTANCE inst) {
@@ -91,14 +92,14 @@ void ApplyWindowIcon(HWND hwnd) {
 
 void WorkerMain() {
   using Clock = std::chrono::steady_clock;
-  gta5::games::slider::PostModuleLog(L"start");
-  gta5::games::slider::PostModuleStatus(L"searching GTA5 window");
+  PostLog(L"start");
+  PostStatus(L"searching GTA5 window");
   HideAllGameOverlays();
 
   const auto deadline = Clock::now() + std::chrono::seconds(20);
   bool completed = false;
   bool gameWindowFound = false;
-  while (!gta5::games::slider::StopRequested() && Clock::now() < deadline) {
+  while (!gta5::app::runtime::StopRequested() && Clock::now() < deadline) {
     if (!gameWindowFound && !gta5::capture::FindGameWindow()) {
       PostStatus(L"searching GTA5 window");
       Sleep(100);
@@ -124,20 +125,20 @@ void WorkerMain() {
         break;
       case GameKind::Flashing:
         completed = gta5::games::flashing::RunSession(
-            [] { return gta5::games::slider::StopRequested(); },
-            [] { return gta5::games::slider::OverlayEnabled(); },
+            [] { return gta5::app::runtime::StopRequested(); },
+            [] { return gta5::app::ui::OverlayEnabled(); },
             [](const std::wstring& text) { PostStatus(text); });
         break;
       case GameKind::ChooseFingerprint:
         completed = gta5::games::choose_fingerprint::RunSession(
-            [] { return gta5::games::slider::StopRequested(); },
-            [] { return gta5::games::slider::OverlayEnabled(); },
+            [] { return gta5::app::runtime::StopRequested(); },
+            [] { return gta5::app::ui::OverlayEnabled(); },
             [](const std::wstring& text) { PostStatus(text); });
         break;
       case GameKind::SortFingerprint:
         completed = gta5::games::sort_fingerprint::RunSession(
-            [] { return gta5::games::slider::StopRequested(); },
-            [] { return gta5::games::slider::OverlayEnabled(); },
+            [] { return gta5::app::runtime::StopRequested(); },
+            [] { return gta5::app::ui::OverlayEnabled(); },
             [](const std::wstring& text) { PostStatus(text); },
             [](const std::wstring& text) { PostLog(text); });
         break;
@@ -147,7 +148,7 @@ void WorkerMain() {
     break;
   }
 
-  if (!completed && !gta5::games::slider::StopRequested() && Clock::now() >= deadline) {
+  if (!completed && !gta5::app::runtime::StopRequested() && Clock::now() >= deadline) {
     PostLog(gameWindowFound ? L"timeout: no supported minigame detected in 20s"
                             : L"timeout: GTA5 window not found in 20s");
     PostStatus(gameWindowFound ? L"detect timeout; stopped" : L"GTA5 timeout; stopped");
@@ -157,47 +158,48 @@ void WorkerMain() {
 
   HideAllGameOverlays();
   gta5::capture::ClearGameWindow();
-  gta5::games::slider::MarkRunning(false);
+  gta5::app::runtime::SetRunning(false);
+  gta5::app::ui::SetRunning(false);
   PostMessageW(g_host, kMsgWorkerDone, 0, 0);
 }
 
 void StartWorker() {
-  if (gta5::games::slider::Running()) return;
-  gta5::games::slider::ResetStopFlag();
+  if (gta5::app::runtime::Running()) return;
+  gta5::app::runtime::ResetStopRequest();
   gta5::games::slider::HideTransientOverlays();
-  gta5::games::slider::MarkRunning(true);
-  gta5::games::slider::UpdatePreviewRunning(true);
-  gta5::games::slider::SetHudStatusText(L"starting");
+  gta5::app::runtime::SetRunning(true);
+  gta5::app::ui::SetRunning(true);
+  gta5::app::ui::SetStatusText(L"starting");
   PostStatus(L"starting");
-  gta5::games::slider::RepaintHud();
-  gta5::games::slider::WorkerThread() = std::thread(WorkerMain);
-  gta5::games::slider::RepaintHud();
+  gta5::app::ui::Repaint();
+  gta5::app::runtime::WorkerThread() = std::thread(WorkerMain);
+  gta5::app::ui::Repaint();
 }
 
 void StopWorker() {
-  if (!gta5::games::slider::Running()) return;
-  gta5::games::slider::SetHudStatusText(L"stopping");
+  if (!gta5::app::runtime::Running()) return;
+  gta5::app::ui::SetStatusText(L"stopping");
   PostStatus(L"stopping");
-  gta5::games::slider::RepaintHud();
-  gta5::games::slider::RequestStop();
+  gta5::app::ui::Repaint();
+  gta5::app::runtime::RequestStop();
   HideAllGameOverlays();
-  auto& worker = gta5::games::slider::WorkerThread();
+  auto& worker = gta5::app::runtime::WorkerThread();
   if (worker.joinable()) worker.join();
-  gta5::games::slider::MarkRunning(false);
-  gta5::games::slider::UpdatePreviewRunning(false);
+  gta5::app::runtime::SetRunning(false);
+  gta5::app::ui::SetRunning(false);
   PostStatus(L"stopped");
-  gta5::games::slider::RepaintHud();
+  gta5::app::ui::Repaint();
 }
 
 LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
   switch (msg) {
     case WM_CREATE:
-      gta5::games::slider::ApplyHotkey(hwnd);
+      gta5::app::ui::ApplyHotkey(hwnd);
       return 0;
     case WM_HOTKEY:
-      if (static_cast<int>(wp) == gta5::games::slider::HotkeyId()) {
-        if (gta5::games::slider::IsListeningHotkey()) return 0;
-        if (gta5::games::slider::Running()) StopWorker();
+      if (static_cast<int>(wp) == gta5::app::ui::HotkeyId()) {
+        if (gta5::app::ui::IsListeningHotkey()) return 0;
+        if (gta5::app::runtime::Running()) StopWorker();
         else StartWorker();
         return 0;
       }
@@ -206,21 +208,21 @@ LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       std::unique_ptr<std::wstring> text(reinterpret_cast<std::wstring*>(lp));
       OutputDebugStringW(text->c_str());
       OutputDebugStringW(L"\n");
-      gta5::games::slider::SetHudLogText(*text);
-      gta5::games::slider::RepaintHud();
+      gta5::app::ui::SetLogText(*text);
+      gta5::app::ui::Repaint();
       return 0;
     }
     case kMsgStatus: {
       std::unique_ptr<std::wstring> text(reinterpret_cast<std::wstring*>(lp));
-      gta5::games::slider::SetHudStatusText(*text);
-      gta5::games::slider::RepaintHud();
+      gta5::app::ui::SetStatusText(*text);
+      gta5::app::ui::Repaint();
       return 0;
     }
     case kMsgWorkerDone: {
-      gta5::games::slider::UpdatePreviewRunning(false);
-      auto& worker = gta5::games::slider::WorkerThread();
+      gta5::app::ui::SetRunning(false);
+      auto& worker = gta5::app::runtime::WorkerThread();
       if (worker.joinable()) worker.detach();
-      gta5::games::slider::RepaintHud();
+      gta5::app::ui::Repaint();
       return 0;
     }
     case WM_CLOSE:
@@ -229,7 +231,7 @@ LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       return 0;
     case WM_DESTROY:
       StopWorker();
-      UnregisterHotKey(hwnd, gta5::games::slider::HotkeyId());
+      UnregisterHotKey(hwnd, gta5::app::ui::HotkeyId());
       PostQuitMessage(0);
       return 0;
   }
@@ -247,7 +249,7 @@ void RegisterClasses(HINSTANCE inst) {
   RegisterClassW(&host);
 
   WNDCLASSW hud{};
-  hud.lpfnWndProc = gta5::games::slider::HudProc;
+  hud.lpfnWndProc = gta5::app::ui::HudProc;
   hud.hInstance = inst;
   hud.hCursor = LoadCursor(nullptr, IDC_ARROW);
   hud.hIcon = g_appIcon;
@@ -301,15 +303,16 @@ bool CreateWindows(HINSTANCE inst) {
                            WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, inst, nullptr);
   if (!g_host) return false;
   ApplyWindowIcon(g_host);
+  gta5::app::ui::SetHostWindow(g_host);
   gta5::games::slider::SetHostWindow(g_host);
 
-  RECT hudRect = gta5::games::slider::InitialHudRect();
+  RECT hudRect = gta5::app::ui::InitialHudRect();
   HWND hud = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_APPWINDOW | WS_EX_NOACTIVATE,
                              L"Gta3In1HudV2", L"Auto Hack 3in1 HUD",
                              WS_POPUP, hudRect.left, hudRect.top,
-                             gta5::games::slider::HudWidth(), gta5::games::slider::HudHeight(),
+                             gta5::app::ui::HudWidth(), gta5::app::ui::HudHeight(),
                              nullptr, nullptr, inst, nullptr);
-  gta5::games::slider::SetHudWindow(hud);
+  gta5::app::ui::SetHudWindow(hud);
   if (hud) {
     ApplyWindowIcon(hud);
     SetLayeredWindowAttributes(hud, RGB(0, 0, 0), 255, LWA_COLORKEY);
@@ -392,7 +395,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     return 0;
   }
 
-  gta5::games::slider::LoadPersistentSettings();
+  gta5::app::ui::LoadPersistentSettings();
   gta5::games::choose_fingerprint::SetUiThread();
   gta5::games::choose_fingerprint::InitStateLock();
 
@@ -401,7 +404,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     return 1;
   }
 
-  PostLog(L"4-in-1 ready: press " + gta5::games::slider::HotkeyName() + L" to start/stop");
+  PostLog(L"4-in-1 ready: press " + gta5::app::ui::HotkeyName() + L" to start/stop");
   PostStatus(L"4-in-1 idle");
 
   MSG msg{};

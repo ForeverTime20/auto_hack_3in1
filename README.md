@@ -32,6 +32,8 @@ if (-not (Get-Command $gxx -ErrorAction SilentlyContinue)) {
 
 & $gxx -std=c++17 -O2 -static -static-libgcc -static-libstdc++ -municode -mwindows `
   "$root\src\main.cpp" `
+  "$root\src\app\app_ui.cpp" `
+  "$root\src\app\app_runtime.cpp" `
   "$root\src\capture\game_window.cpp" `
   "$root\src\games\slider_module.cpp" `
   "$root\src\games\flashing_module.cpp" `
@@ -48,6 +50,8 @@ $root = (Get-Location).Path
 
 cl /nologo /std:c++17 /EHsc /O2 /MT /DUNICODE /D_UNICODE /DNOMINMAX `
   "$root\src\main.cpp" `
+  "$root\src\app\app_ui.cpp" `
+  "$root\src\app\app_runtime.cpp" `
   "$root\src\capture\game_window.cpp" `
   "$root\src\games\slider_module.cpp" `
   "$root\src\games\flashing_module.cpp" `
