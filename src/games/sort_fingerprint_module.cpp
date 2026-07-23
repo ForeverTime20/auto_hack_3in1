@@ -18,6 +18,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
+
 namespace gta5::games::sort_fingerprint {
 
 namespace {
@@ -592,12 +596,11 @@ std::vector<TargetCandidate> buildTargetCandidates(const Binary& target) {
 }
 
 int popcount64(std::uint64_t value) {
-    int count = 0;
-    while (value != 0) {
-        value &= value - 1;
-        ++count;
-    }
-    return count;
+#if defined(_MSC_VER)
+    return static_cast<int>(__popcnt64(value));
+#else
+    return __builtin_popcountll(value);
+#endif
 }
 
 std::array<double, 8> slidingScores(const Binary& piece,

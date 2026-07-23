@@ -8,7 +8,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <propidl.h>
-#include <gdiplus.h>
 
 #include <atomic>
 #include <chrono>
@@ -18,6 +17,7 @@
 
 #include "games/games.h"
 #include "capture/game_window.h"
+#include "resources/resource.h"
 
 namespace {
 
@@ -27,8 +27,6 @@ constexpr UINT kMsgWorkerDone = WM_APP + 3;
 
 HWND g_host = nullptr;
 HICON g_appIcon = nullptr;
-bool g_appIconOwned = false;
-ULONG_PTR g_gdiplusToken = 0;
 HANDLE g_singleInstanceMutex = nullptr;
 
 enum class GameKind {
@@ -81,44 +79,14 @@ void PostLog(const std::wstring& text) {
   gta5::games::slider::PostModuleLog(text);
 }
 
-std::wstring AppIconPath() {
-  wchar_t modulePath[MAX_PATH]{};
-  DWORD len = GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
-  std::wstring path = (len > 0) ? std::wstring(modulePath, len) : L".";
-  size_t slash = path.find_last_of(L"\\/");
-  path = (slash == std::wstring::npos) ? L"icon\\icon.png" : path.substr(0, slash + 1) + L"icon\\icon.png";
-  return path;
-}
-
-HICON LoadPngIcon(bool* owned) {
-  if (owned) *owned = false;
-  Gdiplus::Bitmap bitmap(AppIconPath().c_str());
-  if (bitmap.GetLastStatus() != Gdiplus::Ok) return LoadIconW(nullptr, IDI_APPLICATION);
-
-  HICON icon = nullptr;
-  if (bitmap.GetHICON(&icon) != Gdiplus::Ok || !icon) {
-    return LoadIconW(nullptr, IDI_APPLICATION);
-  }
-  if (owned) *owned = true;
-  return icon;
+HICON LoadAppIcon(HINSTANCE inst) {
+  return LoadIconW(inst, MAKEINTRESOURCEW(IDI_APP_ICON));
 }
 
 void ApplyWindowIcon(HWND hwnd) {
   if (!hwnd || !g_appIcon) return;
   SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(g_appIcon));
   SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(g_appIcon));
-}
-
-void CleanupGraphics() {
-  if (g_appIcon && g_appIconOwned) {
-    DestroyIcon(g_appIcon);
-  }
-  g_appIcon = nullptr;
-  g_appIconOwned = false;
-  if (g_gdiplusToken) {
-    Gdiplus::GdiplusShutdown(g_gdiplusToken);
-    g_gdiplusToken = 0;
-  }
 }
 
 void WorkerMain() {
@@ -410,24 +378,17 @@ bool CreateWindows(HINSTANCE inst) {
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
   SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-  Gdiplus::GdiplusStartupInput gdiplusInput;
-  if (Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusInput, nullptr) == Gdiplus::Ok) {
-    g_appIcon = LoadPngIcon(&g_appIconOwned);
-  } else {
-    g_appIcon = LoadIconW(nullptr, IDI_APPLICATION);
-  }
+  g_appIcon = LoadAppIcon(inst);
 
   g_singleInstanceMutex = CreateMutexW(nullptr, TRUE, L"Local\\AutoHack3in1SingleInstance");
   if (!g_singleInstanceMutex) {
     MessageBoxW(nullptr, L"Failed to start Auto Hack 3in1.", L"Auto Hack 3in1", MB_ICONERROR | MB_OK);
-    CleanupGraphics();
     return 1;
   }
   if (GetLastError() == ERROR_ALREADY_EXISTS) {
     MessageBoxW(nullptr, L"Auto Hack 3in1 is already running.", L"Auto Hack 3in1", MB_ICONINFORMATION | MB_OK);
     CloseHandle(g_singleInstanceMutex);
     g_singleInstanceMutex = nullptr;
-    CleanupGraphics();
     return 0;
   }
 
@@ -437,7 +398,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
 
   RegisterClasses(inst);
   if (!CreateWindows(inst)) {
-    CleanupGraphics();
     return 1;
   }
 
@@ -456,6 +416,5 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     CloseHandle(g_singleInstanceMutex);
     g_singleInstanceMutex = nullptr;
   }
-  CleanupGraphics();
   return 0;
 }
