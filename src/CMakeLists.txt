@@ -2,6 +2,8 @@ add_subdirectory(games)
 
 add_executable(${PROJECT_NAME} WIN32
     main.cpp
+    capture/game_window.cpp
+    capture/game_window.h
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

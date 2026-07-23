@@ -1,6 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include "games.h"
+#include "../capture/game_window.h"
 #ifdef CLI_TEST
 #include <olectl.h>
 #include <gdiplus.h>
@@ -21,7 +22,7 @@
 #include <thread>
 #include <vector>
 
-namespace gta5::games::fingerprint {
+namespace gta5::games::choose_fingerprint {
 
 struct Rect {
     int x = 0, y = 0, w = 0, h = 0;
@@ -168,15 +169,18 @@ static Rect clampRect(Rect r, int w, int h) {
 }
 
 static Rect scaleRectToScreen(const Frame& f, Rect r) {
-    int x1 = (int)std::lround(r.x * f.toScreenX);
-    int y1 = (int)std::lround(r.y * f.toScreenY);
-    int x2 = (int)std::lround((r.x + r.w) * f.toScreenX);
-    int y2 = (int)std::lround((r.y + r.h) * f.toScreenY);
-    return clampRect({x1, y1, x2 - x1, y2 - y1}, f.screenW > 0 ? f.screenW : f.w, f.screenH > 0 ? f.screenH : f.h);
+    int x1 = f.x + (int)std::lround(r.x * f.toScreenX);
+    int y1 = f.y + (int)std::lround(r.y * f.toScreenY);
+    int x2 = f.x + (int)std::lround((r.x + r.w) * f.toScreenX);
+    int y2 = f.y + (int)std::lround((r.y + r.h) * f.toScreenY);
+    x1 = std::clamp(x1, f.x, f.x + f.screenW);
+    y1 = std::clamp(y1, f.y, f.y + f.screenH);
+    x2 = std::clamp(x2, f.x, f.x + f.screenW);
+    y2 = std::clamp(y2, f.y, f.y + f.screenH);
+    return {x1, y1, std::max(0, x2 - x1), std::max(0, y2 - y1)};
 }
 
 static OverlayState scaleOverlayStateToScreen(const Frame& f, OverlayState s) {
-    if (std::abs(f.toScreenX - 1.0) < 1e-6 && std::abs(f.toScreenY - 1.0) < 1e-6) return s;
     s.target = scaleRectToScreen(f, s.target);
     for (auto& b : s.blocks) {
         b.rect = scaleRectToScreen(f, b.rect);
@@ -190,13 +194,17 @@ static Rect padRect(Rect r, int w, int h, double ratio) {
 }
 
 static int scaledPx(int frameW, int frameH, int px1080) {
-    double sx = frameW / 1920.0;
-    double sy = frameH / 1080.0;
-    return std::max(1, (int)std::lround(px1080 * std::min(sx, sy)));
+    (void)frameW;
+    return std::max(1, (int)std::lround(px1080 * (frameH / 1080.0)));
 }
 
 static int scaledPx(const Frame& f, int px1080) {
     return scaledPx(f.w, f.h, px1080);
+}
+
+static int scaledArea(const Frame& f, int area1080) {
+    const double scale = f.h / 1080.0;
+    return std::max(1, (int)std::lround(area1080 * scale * scale));
 }
 
 static std::wstring widenAscii(const std::string& s) {
@@ -354,85 +362,24 @@ static std::vector<Region> connectedRegions(const std::vector<uint8_t>& mask, in
 }
 
 static bool captureScreen(Frame& out) {
-    // Match the known-good GTAscript2 capture path: grab the primary screen
-    // from (0,0). Using the virtual desktop makes the panel too small on
-    // multi-monitor setups and the gate rejects it as "no panel".
-    gVirtualX = 0;
-    gVirtualY = 0;
-    gVirtualW = GetSystemMetrics(SM_CXSCREEN);
-    gVirtualH = GetSystemMetrics(SM_CYSCREEN);
-    int captureW = gVirtualW;
-    int captureH = gVirtualH;
-    if (gVirtualH > 1080) {
-        captureH = 1080;
-        captureW = std::max(1, (int)std::lround(gVirtualW * (captureH / (double)gVirtualH)));
-    }
-
-    static HDC mem = nullptr;
-    static HBITMAP bmp = nullptr;
-    static HGDIOBJ oldObj = nullptr;
-    static void* bits = nullptr;
-    static int bufW = 0;
-    static int bufH = 0;
-
-    HDC screen = GetDC(nullptr);
-    if (!screen) return false;
-
-    if (!mem) {
-        mem = CreateCompatibleDC(screen);
-        if (!mem) {
-            ReleaseDC(nullptr, screen);
-            return false;
-        }
-    }
-
-    if (!bmp || bufW != captureW || bufH != captureH) {
-        if (bmp) {
-            SelectObject(mem, oldObj);
-            DeleteObject(bmp);
-            bmp = nullptr;
-            oldObj = nullptr;
-            bits = nullptr;
-        }
-
-        BITMAPINFO bi{};
-        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        bi.bmiHeader.biWidth = captureW;
-        bi.bmiHeader.biHeight = -captureH;
-        bi.bmiHeader.biPlanes = 1;
-        bi.bmiHeader.biBitCount = 32;
-        bi.bmiHeader.biCompression = BI_RGB;
-
-        bmp = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-        if (!bmp) {
-            bufW = bufH = 0;
-            ReleaseDC(nullptr, screen);
-            return false;
-        }
-        oldObj = SelectObject(mem, bmp);
-        bufW = captureW;
-        bufH = captureH;
-    }
-
-    SetStretchBltMode(mem, COLORONCOLOR);
-    if (!StretchBlt(mem, 0, 0, captureW, captureH, screen, 0, 0, gVirtualW, gVirtualH, SRCCOPY)) {
-        ReleaseDC(nullptr, screen);
-        return false;
-    }
-
-    out.x = gVirtualX; out.y = gVirtualY; out.w = captureW; out.h = captureH;
-    out.screenW = gVirtualW; out.screenH = gVirtualH;
-    out.toScreenX = gVirtualW / (double)std::max(1, captureW);
-    out.toScreenY = gVirtualH / (double)std::max(1, captureH);
+    gta5::capture::GameFrame captured;
+    if (!gta5::capture::CaptureGameFrame(captured)) return false;
+    gVirtualX = captured.screenX;
+    gVirtualY = captured.screenY;
+    gVirtualW = captured.screenW;
+    gVirtualH = captured.screenH;
+    out.x = captured.screenX; out.y = captured.screenY;
+    out.w = captured.width; out.h = captured.height;
+    out.screenW = captured.screenW; out.screenH = captured.screenH;
+    out.toScreenX = captured.toScreenX;
+    out.toScreenY = captured.toScreenY;
     out.bgra.clear();
-    out.gray.resize(captureW * captureH);
-    const uint8_t* px = (const uint8_t*)bits;
-    for (int i = 0; i < captureW * captureH; ++i) {
+    out.gray.resize(static_cast<size_t>(out.w) * out.h);
+    const uint8_t* px = reinterpret_cast<const uint8_t*>(captured.bgra.data());
+    for (int i = 0; i < out.w * out.h; ++i) {
         uint8_t b = px[i * 4 + 0], g = px[i * 4 + 1], r = px[i * 4 + 2];
         out.gray[i] = (uint8_t)((77 * r + 150 * g + 29 * b) >> 8);
     }
-
-    ReleaseDC(nullptr, screen);
     return true;
 }
 
@@ -446,7 +393,7 @@ static bool barMatches(const Region& b, Rect panel, double xmin, double xmax, do
 static bool isTitleBarCandidate(const Frame& f, const Region& rg) {
     Rect r = rg.rect;
     double asp = r.w / (double)std::max(1, r.h);
-    return r.w > f.w * 0.14
+    return r.w > scaledPx(f, 269)
         && r.h >= scaledPx(f, 7)
         && r.h <= scaledPx(f, 48)
         && asp > 5.0
@@ -456,7 +403,7 @@ static bool isTitleBarCandidate(const Frame& f, const Region& rg) {
 
 static bool extractTitleStripFromTallRegion(const Frame& f, const std::vector<uint8_t>& bright, const Region& rg, Region& out) {
     Rect r = rg.rect;
-    if (!(r.w > f.w * 0.14 && r.h > scaledPx(f, 48) && r.h < scaledPx(f, 140))) return false;
+    if (!(r.w > scaledPx(f, 269) && r.h > scaledPx(f, 48) && r.h < scaledPx(f, 140))) return false;
     if (!(rg.cy > f.h * 0.04 && rg.cy < f.h * 0.86)) return false;
 
     const int rowOn = std::max(4, (int)std::lround(r.w * 0.012));
@@ -506,7 +453,7 @@ static RoiInfo detectMinigame(const Frame& f, std::string* diag = nullptr) {
     auto bright = thresholdBright(f.gray, f.w, f.h);
     int k = oddKernel(f.h, f.w, 0.0028);
     bright = closeMask(std::move(bright), f.w, f.h, k);
-    auto regs = connectedRegions(bright, f.w, f.h, (int)std::lround(f.w * f.h * 0.0008));
+    auto regs = connectedRegions(bright, f.w, f.h, scaledArea(f, 1659));
 
     std::vector<Region> bars;
     for (const auto& rg : regs) {
@@ -528,19 +475,20 @@ static RoiInfo detectMinigame(const Frame& f, std::string* diag = nullptr) {
     TitleBars bestBars;
     Rect bestPanel{};
     for (const auto& target : bars) {
-        if (!(target.cx > f.w * 0.40 && target.rect.w > f.w * 0.24 && target.rect.w < f.w * 0.55)) continue;
+        if (!(target.rect.w > scaledPx(f, 461) && target.rect.w < scaledPx(f, 1056))) continue;
         if (!(target.cy > f.h * 0.05 && target.cy < f.h * 0.20)) continue;
 
         for (const auto& components : bars) {
             if (&components == &target) continue;
-            if (!(components.cx < target.cx - f.w * 0.20 && components.rect.w > f.w * 0.16 && components.rect.w < f.w * 0.38)) continue;
+            if (!(components.cx < target.cx - scaledPx(f, 384) &&
+                  components.rect.w > scaledPx(f, 307) && components.rect.w < scaledPx(f, 730))) continue;
             if (!(components.cy > target.cy + f.h * 0.07 && components.cy < target.cy + f.h * 0.23)) continue;
 
             for (const auto& signals : bars) {
                 if (&signals == &target || &signals == &components) continue;
                 if (!(signals.cy > components.cy + f.h * 0.35 && signals.cy < f.h * 0.84)) continue;
-                if (!closeEnough(signals.cx, target.cx, f.w * 0.12)) continue;
-                if (!closeEnough(signals.rect.w, target.rect.w, f.w * 0.16)) continue;
+                if (!closeEnough(signals.cx, target.cx, scaledPx(f, 230))) continue;
+                if (!closeEnough(signals.rect.w, target.rect.w, scaledPx(f, 307))) continue;
 
                 int left = components.rect.x - scaledPx(f, 36);
                 int top = target.rect.y - scaledPx(f, 14);
@@ -548,11 +496,13 @@ static RoiInfo detectMinigame(const Frame& f, std::string* diag = nullptr) {
                 int panelBottom = bottom(signals.rect) + scaledPx(f, 170);
                 Rect panel = clampRect({left, top, panelRight - left, panelBottom - top}, f.w, f.h);
                 double panelAsp = panel.w / (double)std::max(1, panel.h);
-                if (!(panel.w > f.w * 0.45 && panel.h > f.h * 0.45 && panelAsp > 1.0 && panelAsp < 2.0)) continue;
+                if (!(panel.w > scaledPx(f, 864) && panel.h > f.h * 0.45 &&
+                      panelAsp > 1.0 && panelAsp < 2.0)) continue;
 
                 int score = target.pixels + components.pixels + signals.pixels;
                 score -= (int)std::lround(std::abs(signals.cx - target.cx) * 2.0);
-                score -= (int)std::lround(std::abs((target.cx - components.cx) - f.w * 0.31) * 1.5);
+                score -= (int)std::lround(
+                    std::abs((target.cx - components.cx) - scaledPx(f, 595)) * 1.5);
                 if (score > bestScore) {
                     bestScore = score;
                     bestBars.target = target.rect;
@@ -1629,7 +1579,13 @@ bool RunSession(const std::function<bool()>& stopRequested,
   SolverCache cache;
   AutomationState automation;
   gRunning.store(true);
-  gVirtualX = 0; gVirtualY = 0; gVirtualW = GetSystemMetrics(SM_CXSCREEN); gVirtualH = GetSystemMetrics(SM_CYSCREEN);
+  RECT game{};
+  if (!gta5::capture::GetGameClientRect(game)) {
+    gRunning.store(false);
+    return false;
+  }
+  gVirtualX = game.left; gVirtualY = game.top;
+  gVirtualW = game.right - game.left; gVirtualH = game.bottom - game.top;
   syncOverlay();
   bool completedAnyLevel = false;
   int lostFrames = 0;
@@ -1676,4 +1632,4 @@ bool RunSession(const std::function<bool()>& stopRequested,
   return completedAnyLevel;
 }
 
-}  // namespace gta5::games::fingerprint
+}  // namespace gta5::games::choose_fingerprint

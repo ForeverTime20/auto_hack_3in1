@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <windowsx.h>
+#include "../capture/game_window.h"
 
 #include <algorithm>
 #include <atomic>
@@ -107,6 +108,9 @@ struct CaptureFrame {
   int y = 0;
   int w = 0;
   int h = 0;
+  double toScreenX = 1.0;
+  double toScreenY = 1.0;
+  double analysisGeometryScale = 1.0;
   std::vector<uint32_t> bgra;
 };
 
@@ -175,8 +179,8 @@ std::atomic<int> g_hudVelocityPx{0};
 std::atomic<int> g_hudScale100{100};
 std::atomic<int> g_hotkeyVk{VK_F6};
 std::atomic<int> g_pendingHotkeyVk{VK_F6};
-std::atomic<int> g_tapHoldMs{8};
-std::atomic<int> g_tapGapMs{18};
+std::atomic<int> g_tapHoldMs{20};
+std::atomic<int> g_tapGapMs{30};
 std::atomic<bool> g_listeningHotkey{false};
 std::atomic<bool> g_panelExpanded{false};
 std::atomic<bool> g_settingsExpanded{false};
@@ -211,17 +215,17 @@ RECT MonitorRectFromHandle(HMONITOR monitor) {
 }
 
 // All tunable pixel constants are authored for a 1080p game image.
-// Runtime scaling uses the physical monitor height (rcMonitor), not rcWork,
-// so taskbars and reserved desktop areas never shrink the game geometry.
+// Runtime geometry follows the GTA client height, including windowed mode.
 double GeometryScaleFromScreenPoint(int screenX, int screenY) {
-  POINT p{screenX, screenY};
-  RECT mr = MonitorRectFromHandle(MonitorFromPoint(p, MONITOR_DEFAULTTONEAREST));
-  const int h = static_cast<int>(mr.bottom - mr.top);
+  (void)screenX;
+  (void)screenY;
+  RECT game{};
+  const int h = gta5::capture::GetGameClientRect(game) ? game.bottom - game.top : GetSystemMetrics(SM_CYSCREEN);
   return h > 0 ? std::clamp(h / kBaselineScreenHeightPx, 0.45, 2.25) : 1.0;
 }
 
 double GeometryScaleFromRedScreen(const RedBar& red) {
-  if (!red.ok) return std::clamp(GetSystemMetrics(SM_CYSCREEN) / kBaselineScreenHeightPx, 0.45, 2.25);
+  if (!red.ok) return GeometryScaleFromScreenPoint(0, 0);
   return GeometryScaleFromScreenPoint((red.x1 + red.x2) / 2, red.centerY);
 }
 
@@ -275,8 +279,8 @@ void SaveSettings() {
 void LoadSettings() {
   int hotkey = VK_F6;
   int overlay = 1;
-  int tapHold = 8;
-  int tapGap = 18;
+  int tapHold = 20;
+  int tapGap = 30;
   bool ok = false;
   bool needsSave = false;
   const std::wstring path = ExeSiblingPath(L"setting.ini");
@@ -313,19 +317,19 @@ void LoadSettings() {
     }
     ok = sawHotkey && sawOverlay && IsValidHotkeyVk(hotkey) && (overlay == 0 || overlay == 1);
     if (!sawTapHold || tapHold < 1 || tapHold > 250) {
-      tapHold = 8;
+      tapHold = 20;
       needsSave = true;
     }
     if (!sawTapGap || tapGap < 1 || tapGap > 250) {
-      tapGap = 18;
+      tapGap = 30;
       needsSave = true;
     }
   }
   if (!ok) {
     hotkey = VK_F6;
     overlay = 1;
-    tapHold = 8;
-    tapGap = 18;
+    tapHold = 20;
+    tapGap = 30;
     needsSave = true;
   }
   g_hotkeyVk.store(hotkey, std::memory_order_relaxed);
@@ -439,7 +443,8 @@ RECT InitialHudScreenRect() {
   }
 
   RECT gtaRect{};
-  if (FindWindowRectByExe(L"gta5.exe", &gtaRect)) {
+  if (FindWindowRectByExe(L"GTA5_Enhanced.exe", &gtaRect) ||
+      FindWindowRectByExe(L"GTA5.exe", &gtaRect)) {
     monitor = MonitorFromRect(&gtaRect, MONITOR_DEFAULTTONEAREST);
   }
   if (!monitor) {
@@ -625,69 +630,46 @@ bool IsYellow(uint32_t px) {
 }
 
 bool CaptureScreenRegion(CaptureFrame& frame, const RectI* region) {
-  const int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
-  const int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
-  const int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-  const int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-
+  RECT requested{};
+  const RECT* requestedPtr = nullptr;
   if (region) {
-    const int x1 = std::max(vx, region->x);
-    const int y1 = std::max(vy, region->y);
-    const int x2 = std::min(vx + vw, region->x + region->w);
-    const int y2 = std::min(vy + vh, region->y + region->h);
-    frame.x = x1;
-    frame.y = y1;
-    frame.w = std::max(1, x2 - x1);
-    frame.h = std::max(1, y2 - y1);
-  } else {
-    frame.x = vx;
-    frame.y = vy;
-    frame.w = vw;
-    frame.h = vh;
+    requested = {region->x, region->y, region->x + region->w, region->y + region->h};
+    requestedPtr = &requested;
   }
-  if (frame.w <= 0 || frame.h <= 0) return false;
-
-  HDC screen = GetDC(nullptr);
-  HDC mem = CreateCompatibleDC(screen);
-  if (!screen || !mem) {
-    if (mem) DeleteDC(mem);
-    if (screen) ReleaseDC(nullptr, screen);
-    return false;
-  }
-
-  BITMAPINFO bmi{};
-  bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-  bmi.bmiHeader.biWidth = frame.w;
-  bmi.bmiHeader.biHeight = -frame.h;
-  bmi.bmiHeader.biPlanes = 1;
-  bmi.bmiHeader.biBitCount = 32;
-  bmi.bmiHeader.biCompression = BI_RGB;
-
-  void* bits = nullptr;
-  HBITMAP dib = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
-  if (!dib || !bits) {
-    if (dib) DeleteObject(dib);
-    DeleteDC(mem);
-    ReleaseDC(nullptr, screen);
-    return false;
-  }
-
-  HGDIOBJ old = SelectObject(mem, dib);
-  BOOL copied = BitBlt(mem, 0, 0, frame.w, frame.h, screen, frame.x, frame.y, SRCCOPY);
-  frame.bgra.resize(static_cast<size_t>(frame.w) * frame.h);
-  if (copied) {
-    std::memcpy(frame.bgra.data(), bits, frame.bgra.size() * sizeof(uint32_t));
-  }
-
-  SelectObject(mem, old);
-  DeleteObject(dib);
-  DeleteDC(mem);
-  ReleaseDC(nullptr, screen);
-  return copied == TRUE;
+  gta5::capture::GameFrame captured;
+  if (!gta5::capture::CaptureGameFrame(captured, requestedPtr)) return false;
+  RECT game{};
+  if (!gta5::capture::GetGameClientRect(game)) return false;
+  frame.x = captured.screenX;
+  frame.y = captured.screenY;
+  frame.w = captured.width;
+  frame.h = captured.height;
+  frame.toScreenX = captured.toScreenX;
+  frame.toScreenY = captured.toScreenY;
+  const int gameHeight = static_cast<int>(game.bottom - game.top);
+  frame.analysisGeometryScale = std::clamp(std::min(gameHeight, 1080) / kBaselineScreenHeightPx, 0.45, 2.25);
+  frame.bgra = std::move(captured.bgra);
+  return true;
 }
 
 uint32_t Pixel(const CaptureFrame& f, int x, int y) {
   return f.bgra[static_cast<size_t>(y) * f.w + x];
+}
+
+int ToScreenX(const CaptureFrame& f, int x) {
+  return f.x + static_cast<int>(std::lround(x * f.toScreenX));
+}
+
+int ToScreenY(const CaptureFrame& f, int y) {
+  return f.y + static_cast<int>(std::lround(y * f.toScreenY));
+}
+
+int ToFrameX(const CaptureFrame& f, int x) {
+  return static_cast<int>(std::lround((x - f.x) / std::max(0.0001, f.toScreenX)));
+}
+
+int ToFrameY(const CaptureFrame& f, int y) {
+  return static_cast<int>(std::lround((y - f.y) / std::max(0.0001, f.toScreenY)));
 }
 
 std::vector<std::pair<int, int>> GroupRuns(const std::vector<int>& values, int begin, int end, int threshold, int minWidth);
@@ -954,10 +936,12 @@ SearchCells BuildSearchCellsFromWhiteBars(const std::vector<BarMeasure>& bars, d
 }
 
 bool MeasureYellowGapForBar(const CaptureFrame& f, const RedBar& red, int index, int cellLeftScreen, int cellRightScreen, double scale, YellowMeasure& out) {
-  const int cellLeft = cellLeftScreen - f.x;
-  const int cellRight = cellRightScreen - f.x;
-  const int y1 = std::max(0, red.centerY - f.y - ScaledPx(320, scale));
-  const int y2 = std::min(f.h - 1, red.centerY - f.y + ScaledPx(320, scale));
+  const double localScale = scale / std::max(0.0001, (f.toScreenX + f.toScreenY) * 0.5);
+  const int cellLeft = ToFrameX(f, cellLeftScreen);
+  const int cellRight = ToFrameX(f, cellRightScreen);
+  const int centerY = ToFrameY(f, red.centerY);
+  const int y1 = std::max(0, centerY - ScaledPx(320, localScale));
+  const int y2 = std::min(f.h - 1, centerY + ScaledPx(320, localScale));
   if (cellRight < 0 || cellLeft >= f.w || y2 <= y1) return false;
 
   std::vector<int> rowCount(f.h, 0);
@@ -971,7 +955,7 @@ bool MeasureYellowGapForBar(const CaptureFrame& f, const RedBar& red, int index,
     rowCount[y] = count;
   }
 
-  auto runs = GroupRuns(rowCount, y1, y2 + 1, ScaledPx(2, scale), ScaledPx(6, scale));
+  auto runs = GroupRuns(rowCount, y1, y2 + 1, ScaledPx(2, localScale), ScaledPx(6, localScale));
   if (runs.size() < 2) return false;
 
   std::pair<int, int> topRun{};
@@ -982,14 +966,14 @@ bool MeasureYellowGapForBar(const CaptureFrame& f, const RedBar& red, int index,
       const int verticalGap = runs[j].first - runs[i].second - 1;
       const int topHeight = runs[i].second - runs[i].first + 1;
       const int bottomHeight = runs[j].second - runs[j].first + 1;
-      if (verticalGap < ScaledPx(8, scale) || verticalGap > ScaledPx(95, scale)) continue;
-      if (topHeight < ScaledPx(10, scale) || bottomHeight < ScaledPx(10, scale)) continue;
+      if (verticalGap < ScaledPx(8, localScale) || verticalGap > ScaledPx(95, localScale)) continue;
+      if (topHeight < ScaledPx(10, localScale) || bottomHeight < ScaledPx(10, localScale)) continue;
 
       int yellowPixels = 0;
       for (int y = runs[i].first; y <= runs[i].second; ++y) yellowPixels += rowCount[y];
       for (int y = runs[j].first; y <= runs[j].second; ++y) yellowPixels += rowCount[y];
       const int balancePenalty = std::abs(topHeight - bottomHeight) * 2;
-      const int gapPenalty = std::abs(verticalGap - ScaledPx(24, scale));
+      const int gapPenalty = std::abs(verticalGap - ScaledPx(24, localScale));
       const int score = yellowPixels + topHeight + bottomHeight - balancePenalty - gapPenalty;
       if (score > bestScore) {
         bestScore = score;
@@ -1002,8 +986,8 @@ bool MeasureYellowGapForBar(const CaptureFrame& f, const RedBar& red, int index,
 
   out.ok = true;
   out.index = index;
-  out.topBottomY = topRun.second + f.y;
-  out.bottomTopY = bottomRun.first + f.y;
+  out.topBottomY = ToScreenY(f, topRun.second);
+  out.bottomTopY = ToScreenY(f, bottomRun.first);
   out.gapCenterY = (out.topBottomY + out.bottomTopY) / 2.0;
   int score = 0;
   for (int y = topRun.first; y <= topRun.second; ++y) score += rowCount[y];
@@ -1021,7 +1005,8 @@ YellowMeasure FindActiveYellowMeasure(const CaptureFrame& f, const RedBar& red, 
       if (!best.ok || m.score > best.score) best = m;
     }
   }
-  if (best.ok && best.score < ScaledPx(20, scale)) best.ok = false;
+  const double localScale = scale / std::max(0.0001, (f.toScreenX + f.toScreenY) * 0.5);
+  if (best.ok && best.score < ScaledPx(20, localScale)) best.ok = false;
   return best;
 }
 
@@ -1035,7 +1020,8 @@ YellowMeasure FindActiveYellowMeasureCandidates(const CaptureFrame& f, const Red
       if (!best.ok || m.score > best.score) best = m;
     }
   }
-  if (best.ok && best.score < ScaledPx(20, scale)) best.ok = false;
+  const double localScale = scale / std::max(0.0001, (f.toScreenX + f.toScreenY) * 0.5);
+  if (best.ok && best.score < ScaledPx(20, localScale)) best.ok = false;
   return best;
 }
 
@@ -1047,8 +1033,7 @@ FrameAnalysis AnalyzeFrame(const CaptureFrame& f, const std::vector<std::pair<in
     analysis.minigameLog = L"not in minigame: red line not found";
     return analysis;
   }
-  const double scale = GeometryScaleFromScreenPoint(f.x + (analysis.red.x1 + analysis.red.x2) / 2,
-                                                    f.y + analysis.red.centerY);
+  const double scale = f.analysisGeometryScale;
   if (knownXRuns && knownXRuns->size() == 8) {
     analysis.bars = LocateWhiteBarsAtKnownX(f, analysis.red, *knownXRuns, scale);
   }
@@ -1058,19 +1043,19 @@ FrameAnalysis AnalyzeFrame(const CaptureFrame& f, const std::vector<std::pair<in
   analysis.ok = analysis.bars.size() >= 8;
   analysis.inMinigame = analysis.ok;
 
-  analysis.red.x1 += f.x;
-  analysis.red.x2 += f.x;
-  analysis.red.y1 += f.y;
-  analysis.red.y2 += f.y;
-  analysis.red.centerY += f.y;
+  analysis.red.x1 = ToScreenX(f, analysis.red.x1);
+  analysis.red.x2 = ToScreenX(f, analysis.red.x2);
+  analysis.red.y1 = ToScreenY(f, analysis.red.y1);
+  analysis.red.y2 = ToScreenY(f, analysis.red.y2);
+  analysis.red.centerY = ToScreenY(f, analysis.red.centerY);
   for (auto& bar : analysis.bars) {
-    bar.x1 += f.x;
-    bar.x2 += f.x;
-    bar.topY1 += f.y;
-    bar.topY2 += f.y;
-    bar.bottomY1 += f.y;
-    bar.bottomY2 += f.y;
-    bar.gapCenterY += f.y;
+    bar.x1 = ToScreenX(f, bar.x1);
+    bar.x2 = ToScreenX(f, bar.x2);
+    bar.topY1 = ToScreenY(f, bar.topY1);
+    bar.topY2 = ToScreenY(f, bar.topY2);
+    bar.bottomY1 = ToScreenY(f, bar.bottomY1);
+    bar.bottomY2 = ToScreenY(f, bar.bottomY2);
+    bar.gapCenterY = f.y + bar.gapCenterY * f.toScreenY;
   }
   if (analysis.inMinigame) {
     analysis.minigameStatus = L"in minigame";
@@ -1088,11 +1073,11 @@ FrameAnalysis AnalyzeLockedGeometry(const CaptureFrame& f, const RedBar& lockedR
   if (!lockedRedScreen.ok || lockedBarsScreen.size() < 8) return analysis;
 
   RedBar localRed = lockedRedScreen;
-  localRed.x1 -= f.x;
-  localRed.x2 -= f.x;
-  localRed.y1 -= f.y;
-  localRed.y2 -= f.y;
-  localRed.centerY -= f.y;
+  localRed.x1 = ToFrameX(f, localRed.x1);
+  localRed.x2 = ToFrameX(f, localRed.x2);
+  localRed.y1 = ToFrameY(f, localRed.y1);
+  localRed.y2 = ToFrameY(f, localRed.y2);
+  localRed.centerY = ToFrameY(f, localRed.centerY);
   if (localRed.x2 < 0 || localRed.x1 >= f.w || localRed.centerY < 0 || localRed.centerY >= f.h) {
     return analysis;
   }
@@ -1341,7 +1326,7 @@ void WorkerLoop() {
       std::vector<std::pair<int, int>> knownBarXRunsLocal;
       if (knownBarXRunsScreen.size() == 8) {
         for (auto [x1, x2] : knownBarXRunsScreen) {
-          knownBarXRunsLocal.push_back({x1 - frame.x, x2 - frame.x});
+          knownBarXRunsLocal.push_back({ToFrameX(frame, x1), ToFrameX(frame, x2)});
         }
       }
       a = AnalyzeFrame(frame, knownBarXRunsLocal.size() == 8 ? &knownBarXRunsLocal : nullptr);

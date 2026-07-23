@@ -1,9 +1,13 @@
 name: Release
+run-name: Release ${{ inputs.tag }}
 
 on:
-  push:
-    tags:
-      - '*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (for example, v1.3)
+        required: true
+        type: string
 
 jobs:
   #  MSVC Build 
@@ -12,6 +16,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
 
       - name: Configure
         run: cmake -B build -A x64
@@ -23,7 +29,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: msvc
-          path: build/src/Release/auto_hack_3in1.exe
+          path: build/src/Release/auto_hack_4in1.exe
 
   #  MinGW Build 
   mingw:
@@ -31,6 +37,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
 
       - uses: msys2/setup-msys2@v2
         with:
@@ -53,7 +61,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: mingw
-          path: build/src/auto_hack_3in1.exe
+          path: build/src/auto_hack_4in1.exe
 
   #  Release 
   release:
@@ -65,6 +73,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
 
       - name: Download artifacts
@@ -72,10 +81,10 @@ jobs:
 
       - name: Organize & tag-name artifacts
         run: |
-          TAG="${{ github.ref_name }}"
+          TAG="${{ inputs.tag }}"
           mkdir -p dist
-          cp msvc/auto_hack_3in1.exe  "dist/auto_hack_3in1-${TAG}-msvc.exe"
-          cp mingw/auto_hack_3in1.exe "dist/auto_hack_3in1-${TAG}-mingw.exe"
+          cp msvc/auto_hack_4in1.exe  "dist/auto_hack_4in1-${TAG}-msvc.exe"
+          cp mingw/auto_hack_4in1.exe "dist/auto_hack_4in1-${TAG}-mingw.exe"
           sha256sum dist/*.exe > dist/checksums.txt
           ls -lh dist/
 
@@ -83,7 +92,7 @@ jobs:
       # We pre-pend the raw commit log for full transparency.
       - name: Prepare commit summary
         run: |
-          TAG="${{ github.ref_name }}"
+          TAG="${{ inputs.tag }}"
           PREV=$(git describe --tags --abbrev=0 "$TAG^" 2>/dev/null || echo "")
           RANGE="${PREV:+$PREV..}$TAG"
 
@@ -97,8 +106,8 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
+          tag_name: ${{ inputs.tag }}
+          name: ${{ inputs.tag }}
           body_path: notes.md
           files: dist/*
           generate_release_notes: true

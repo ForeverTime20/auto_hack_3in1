@@ -9,6 +9,7 @@
 #include <dwmapi.h>
 #include <commctrl.h>
 #include "games.h"
+#include "../capture/game_window.h"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -59,6 +60,8 @@ struct ScreenShot {
     int h = 0;
     int screenW = 0;
     int screenH = 0;
+    int screenX = 0;
+    int screenY = 0;
     double toScreenX = 1.0;
     double toScreenY = 1.0;
     std::vector<uint8_t> pixels;
@@ -92,28 +95,20 @@ struct HLine {
     int x2 = 0;
 };
 
-static int CaptureHeightForScreen(int screenH) {
-    return screenH > 1080 ? 1080 : screenH;
-}
-
-static int CaptureWidthForScreen(int screenW, int screenH, int captureH) {
-    return screenH > 0 ? std::max(1, static_cast<int>(std::lround(screenW * (captureH / static_cast<double>(screenH))))) : screenW;
-}
-
 static int ToScreenX(const ScreenShot& shot, int x) {
-    return static_cast<int>(std::lround(x * shot.toScreenX));
+    return shot.screenX + static_cast<int>(std::lround(x * shot.toScreenX));
 }
 
 static int ToScreenY(const ScreenShot& shot, int y) {
-    return static_cast<int>(std::lround(y * shot.toScreenY));
+    return shot.screenY + static_cast<int>(std::lround(y * shot.toScreenY));
 }
 
 static int ToShotX(const ScreenShot& shot, int x) {
-    return static_cast<int>(std::lround(x / std::max(0.0001, shot.toScreenX)));
+    return static_cast<int>(std::lround((x - shot.screenX) / std::max(0.0001, shot.toScreenX)));
 }
 
 static int ToShotY(const ScreenShot& shot, int y) {
-    return static_cast<int>(std::lround(y / std::max(0.0001, shot.toScreenY)));
+    return static_cast<int>(std::lround((y - shot.screenY) / std::max(0.0001, shot.toScreenY)));
 }
 
 static std::vector<WhiteBar> FindWhiteBars(const ScreenShot& shot);
@@ -187,43 +182,18 @@ static int GetEditInt(HWND h, int fallback) {
 }
 
 static bool CaptureScreen(ScreenShot& shot) {
-    shot.screenW = GetSystemMetrics(SM_CXSCREEN);
-    shot.screenH = GetSystemMetrics(SM_CYSCREEN);
-    if (shot.screenW <= 0 || shot.screenH <= 0) return false;
-    shot.h = CaptureHeightForScreen(shot.screenH);
-    shot.w = CaptureWidthForScreen(shot.screenW, shot.screenH, shot.h);
-    shot.toScreenX = shot.screenW / static_cast<double>(std::max(1, shot.w));
-    shot.toScreenY = shot.screenH / static_cast<double>(std::max(1, shot.h));
-
-    HDC screen = GetDC(nullptr);
-    HDC mem = CreateCompatibleDC(screen);
-    BITMAPINFO bmi{};
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = shot.w;
-    bmi.bmiHeader.biHeight = -shot.h;
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-
-    void* bits = nullptr;
-    HBITMAP dib = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
-    if (!dib || !bits) {
-        if (dib) DeleteObject(dib);
-        DeleteDC(mem);
-        ReleaseDC(nullptr, screen);
-        return false;
-    }
-
-    HGDIOBJ old = SelectObject(mem, dib);
-    SetStretchBltMode(mem, COLORONCOLOR);
-    StretchBlt(mem, 0, 0, shot.w, shot.h, screen, 0, 0, shot.screenW, shot.screenH, SRCCOPY);
-    shot.pixels.resize(static_cast<size_t>(shot.w) * shot.h * 4);
-    memcpy(shot.pixels.data(), bits, shot.pixels.size());
-
-    SelectObject(mem, old);
-    DeleteObject(dib);
-    DeleteDC(mem);
-    ReleaseDC(nullptr, screen);
+    gta5::capture::GameFrame captured;
+    if (!gta5::capture::CaptureGameFrame(captured)) return false;
+    shot.screenX = captured.screenX;
+    shot.screenY = captured.screenY;
+    shot.screenW = captured.screenW;
+    shot.screenH = captured.screenH;
+    shot.w = captured.width;
+    shot.h = captured.height;
+    shot.toScreenX = captured.toScreenX;
+    shot.toScreenY = captured.toScreenY;
+    shot.pixels.resize(captured.bgra.size() * sizeof(uint32_t));
+    memcpy(shot.pixels.data(), captured.bgra.data(), shot.pixels.size());
     return true;
 }
 
@@ -369,8 +339,6 @@ static void CommitCircleGrid(const ScreenShot& shot, const Circle& topLeft, cons
 }
 
 static void ScaleLockedGeometryToScreen(const ScreenShot& shot) {
-    if (std::abs(shot.toScreenX - 1.0) < 1e-6 && std::abs(shot.toScreenY - 1.0) < 1e-6) return;
-
     int roiRight = ToScreenX(shot, g.roiX + g.roiW);
     int roiBottom = ToScreenY(shot, g.roiY + g.roiH);
     g.roiX = ToScreenX(shot, g.roiX);
@@ -380,7 +348,7 @@ static void ScaleLockedGeometryToScreen(const ScreenShot& shot) {
 
     g.searchX = ToScreenX(shot, g.searchX);
     g.searchY = ToScreenY(shot, g.searchY);
-    g.searchSize = std::max(1, ToScreenX(shot, g.searchSize));
+    g.searchSize = std::max(1, static_cast<int>(std::lround(g.searchSize * shot.toScreenX)));
 
     for (Circle& circle : g.circles) {
         circle.x = ToScreenX(shot, circle.x);
@@ -524,7 +492,7 @@ static std::vector<WhiteBar> FindWhiteBars(const ScreenShot& shot) {
     const int screenH = shot.h;
     const int yMin = std::max(ScalePx(80, screenH), screenH / 10);
     const int yMax = std::min(screenH / 2, screenH - ScalePx(260, screenH));
-    const int minRun = std::max(ScalePx(260, screenH), screenW / 7);
+    const int minRun = ScalePx(274, screenH);
     const int maxGap = ScalePx(18, screenH);
     const int barPadTop = ScalePx(5, screenH);
     const int barPadBottom = ScalePx(18, screenH);
@@ -537,7 +505,7 @@ static std::vector<WhiteBar> FindWhiteBars(const ScreenShot& shot) {
         int runStart = 0;
         int gap = 0;
 
-        for (int x = screenW / 10; x < screenW * 85 / 100; x += 2) {
+        for (int x = 0; x < screenW; x += 2) {
             const uint8_t* p = shot.pixels.data() + (static_cast<size_t>(y) * screenW + x) * 4;
             bool white = IsWhiteUiPixel(p[2], p[1], p[0]);
             if (white) {
@@ -575,19 +543,16 @@ static std::vector<WhiteBar> FindWhiteBars(const ScreenShot& shot) {
 }
 
 static bool FindSignalRepeaterBar(const ScreenShot& shot, const std::vector<WhiteBar>& bars, WhiteBar& signal) {
-    const int screenW = shot.w;
     const int screenH = shot.h;
     int bestRank = -1000000;
 
     for (const WhiteBar& b : bars) {
-        int centerX = b.x + b.w / 2;
-        bool leftPanel = centerX < screenW * 63 / 100;
         bool belowTopBoxes = b.y > screenH * 16 / 100;
         bool notTooLow = b.y < screenH * 34 / 100;
-        bool wideEnough = b.w > screenW * 28 / 100;
-        if (!leftPanel || !belowTopBoxes || !notTooLow || !wideEnough || b.score < 28) continue;
+        bool wideEnough = b.w > ScalePx(537, screenH);
+        if (!belowTopBoxes || !notTooLow || !wideEnough || b.score < 28) continue;
 
-        int rank = b.w * 3 + b.y * 6 - std::abs(centerX - screenW * 2 / 5);
+        int rank = b.w * 3 + b.y * 6;
         if (rank > bestRank) {
             bestRank = rank;
             signal = b;
@@ -606,13 +571,11 @@ static bool AnalyzeMinigamePage(const ScreenShot& shot, WhiteBar* signalOut = nu
     bool hasRightTitle = false;
     int topTitleCount = 0;
     for (const WhiteBar& b : bars) {
-        int centerX = b.x + b.w / 2;
         int centerY = b.y + b.h / 2;
 
         if (std::abs(centerY - (signal.y + signal.h / 2)) < titleYSlack &&
             b.x > signal.x + signal.w * 3 / 4 &&
-            centerX > shot.w * 55 / 100 &&
-            b.w > shot.w * 14 / 100 &&
+            b.w > ScalePx(268, shot.h) &&
             b.score >= 28) {
             hasRightTitle = true;
         }
@@ -620,7 +583,7 @@ static bool AnalyzeMinigamePage(const ScreenShot& shot, WhiteBar* signalOut = nu
         if (centerY < signal.y - titleYSlack &&
             centerY > shot.h * 8 / 100 &&
             centerY < shot.h * 24 / 100 &&
-            b.w > shot.w * 18 / 100 &&
+            b.w > ScalePx(345, shot.h) &&
             b.score >= 28) {
             ++topTitleCount;
         }
@@ -717,7 +680,6 @@ static bool FindLevelBlock(const ScreenShot& shot, UiRect& block) {
     if (!FindSignalRepeaterBar(shot, bars, signal)) return false;
     if (!FindDecodedDigitsBar(shot, bars, signal, decoded)) return false;
 
-    int top = shot.h;
     int bottom = 0;
     std::vector<int> centers;
     std::vector<int> radii;
@@ -727,22 +689,16 @@ static bool FindLevelBlock(const ScreenShot& shot, UiRect& block) {
         int r = std::max(1, static_cast<int>(std::lround(circle.r / std::max(0.0001, shot.toScreenY))));
         centers.push_back(cy);
         radii.push_back(r);
-        top = std::min(top, cy - r);
         bottom = std::max(bottom, cy + r);
     }
     std::sort(centers.begin(), centers.end());
     std::sort(radii.begin(), radii.end());
     int radius = radii[radii.size() / 2];
-    int rowGap = centers.size() >= 2 ? centers[1] - centers[0] : radius * 2;
-    for (size_t i = 2; i < centers.size(); ++i) {
-        rowGap = std::min(rowGap, centers[i] - centers[i - 1]);
-    }
-
     UiRect search{
         std::max(0, decoded.x - ScalePx(8, scaleH)),
-        std::max(0, top),
+        std::max(0, centers.back() - radius),
         std::min(shot.w - 1, decoded.x + decoded.w + ScalePx(8, scaleH)),
-        std::min(shot.h - 1, bottom + rowGap + radius * 2)
+        std::min(shot.h - 1, bottom + ScalePx(150, scaleH))
     };
     if (search.right <= search.left || search.bottom <= search.top) return false;
 
@@ -753,7 +709,7 @@ static bool FindLevelBlock(const ScreenShot& shot, UiRect& block) {
         search,
         minBlockW,
         maxBlockW,
-        ScalePx(10, scaleH));
+        ScalePx(20, scaleH));
 
     int bestScore = -1;
     UiRect best{};
@@ -911,68 +867,13 @@ static double MsSince(std::chrono::steady_clock::time_point start) {
 
 static CaptureResult CaptureFrame(bool detectBlue) {
     CaptureResult result{};
-
-    const int screenH = GetSystemMetrics(SM_CYSCREEN);
-    const double downScale = screenH > 1080 ? screenH / 1080.0 : 1.0;
-    const int captureW = std::max(1, static_cast<int>(std::lround(g.roiW / downScale)));
-    const int captureH = std::max(1, static_cast<int>(std::lround(g.roiH / downScale)));
-
-    static HDC mem = nullptr;
-    static HBITMAP dib = nullptr;
-    static HGDIOBJ old = nullptr;
-    static void* bits = nullptr;
-    static int bufW = 0;
-    static int bufH = 0;
-
-    HDC screen = GetDC(nullptr);
-    if (!screen) return result;
-    if (!mem) {
-        mem = CreateCompatibleDC(screen);
-        if (!mem) {
-            ReleaseDC(nullptr, screen);
-            return result;
-        }
-    }
-
-    if (!dib || bufW != captureW || bufH != captureH) {
-        if (dib) {
-            SelectObject(mem, old);
-            DeleteObject(dib);
-            dib = nullptr;
-            old = nullptr;
-            bits = nullptr;
-        }
-
-        BITMAPINFO bmi{};
-        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        bmi.bmiHeader.biWidth = captureW;
-        bmi.bmiHeader.biHeight = -captureH;
-        bmi.bmiHeader.biPlanes = 1;
-        bmi.bmiHeader.biBitCount = 32;
-        bmi.bmiHeader.biCompression = BI_RGB;
-
-        dib = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
-        if (!dib || !bits) {
-            if (dib) DeleteObject(dib);
-            dib = nullptr;
-            bits = nullptr;
-            bufW = bufH = 0;
-            ReleaseDC(nullptr, screen);
-            return result;
-        }
-        old = SelectObject(mem, dib);
-        bufW = captureW;
-        bufH = captureH;
-    }
-
-    SetStretchBltMode(mem, COLORONCOLOR);
-    if (!StretchBlt(mem, 0, 0, captureW, captureH, screen, g.roiX, g.roiY, g.roiW, g.roiH, SRCCOPY)) {
-        ReleaseDC(nullptr, screen);
-        return result;
-    }
-    ReleaseDC(nullptr, screen);
-
-    const uint8_t* px = static_cast<const uint8_t*>(bits);
+    RECT roi{g.roiX, g.roiY, g.roiX + g.roiW, g.roiY + g.roiH};
+    gta5::capture::GameFrame captured;
+    if (!gta5::capture::CaptureGameFrame(captured, &roi)) return result;
+    const double downScale = (captured.toScreenX + captured.toScreenY) * 0.5;
+    const int captureW = captured.width;
+    const int captureH = captured.height;
+    const uint8_t* px = reinterpret_cast<const uint8_t*>(captured.bgra.data());
     const int stride = captureW * 4;
     if (!px) return result;
     if (detectBlue) {
@@ -980,8 +881,8 @@ static CaptureResult CaptureFrame(bool detectBlue) {
             for (int c = 0; c < GRID_COLS; ++c) {
                 int idx = r * GRID_COLS + c;
                 Circle circle = g.circles[idx];
-                double cx = static_cast<double>(circle.x - g.roiX) / downScale;
-                double cy = static_cast<double>(circle.y - g.roiY) / downScale;
+                double cx = static_cast<double>(circle.x - captured.screenX) / captured.toScreenX;
+                double cy = static_cast<double>(circle.y - captured.screenY) / captured.toScreenY;
                 double radius = std::max(6.0, circle.r * 0.36 / downScale);
                 double radiusSq = radius * radius;
                 int x0 = std::max(0, static_cast<int>(std::floor(cx - radius)));
@@ -1015,8 +916,8 @@ static CaptureResult CaptureFrame(bool detectBlue) {
     int bestScore = 0;
     for (int idx = 0; idx < GRID_CELLS; ++idx) {
         Circle circle = g.circles[idx];
-        double cx = static_cast<double>(circle.x - g.roiX) / downScale;
-        double cy = static_cast<double>(circle.y - g.roiY) / downScale;
+        double cx = static_cast<double>(circle.x - captured.screenX) / captured.toScreenX;
+        double cy = static_cast<double>(circle.y - captured.screenY) / captured.toScreenY;
         double rLocal = circle.r / downScale;
         double inner = rLocal + std::max(3.0, rLocal * 0.10);
         double outer = rLocal + std::max(10.0, rLocal * 0.38);
@@ -1323,9 +1224,10 @@ static void StopCapture() {
 }
 
 static void PositionOverlay() {
-    int screenW = GetSystemMetrics(SM_CXSCREEN);
-    int screenH = GetSystemMetrics(SM_CYSCREEN);
-    SetWindowPos(g.overlayWnd, HWND_TOPMOST, 0, 0, screenW, screenH,
+    RECT game{};
+    if (!gta5::capture::GetGameClientRect(game)) return;
+    SetWindowPos(g.overlayWnd, HWND_TOPMOST, game.left, game.top,
+                 game.right - game.left, game.bottom - game.top,
                  SWP_NOACTIVATE | SWP_SHOWWINDOW);
 }
 
@@ -1341,6 +1243,9 @@ static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         HBRUSH bg = CreateSolidBrush(RGB(0, 0, 0));
         FillRect(hdc, &rc, bg);
         DeleteObject(bg);
+
+        RECT game{};
+        if (gta5::capture::GetGameClientRect(game)) SetViewportOrgEx(hdc, -game.left, -game.top, nullptr);
 
         SetBkMode(hdc, TRANSPARENT);
         if (!g.running || !g.minigameVisible || !g.circlesReady) {
@@ -1650,8 +1555,7 @@ bool RunSession(const std::function<bool()>& stopRequested,
   auto syncOverlay = [&] {
     if (!g.overlayWnd) return;
     if (overlayEnabled()) {
-      SetWindowPos(g.overlayWnd, HWND_TOPMOST, 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN),
-                   SWP_NOACTIVATE | SWP_SHOWWINDOW);
+      PositionOverlay();
     } else {
       ShowWindow(g.overlayWnd, SW_HIDE);
     }

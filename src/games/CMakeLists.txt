@@ -1,7 +1,8 @@
 add_library(games STATIC
     slider_module.cpp
     flashing_module.cpp
-    fingerprint_module.cpp
+    choose_fingerprint_module.cpp
+    sort_fingerprint_module.cpp
     games.h
 )
 
