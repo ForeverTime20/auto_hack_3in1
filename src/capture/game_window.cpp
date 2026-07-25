@@ -148,6 +148,10 @@ thread_local CaptureResources gCapture;
 bool CaptureGameFrame(GameFrame& frame, const RECT* screenRegion) {
   RECT client{};
   if (!GetGameClientRect(client)) return false;
+  return CaptureGameFrameFromClientRect(frame, client, screenRegion);
+}
+
+bool CaptureGameFrameFromClientRect(GameFrame& frame, const RECT& client, const RECT* screenRegion) {
   RECT source = client;
   if (screenRegion) {
     if (!IntersectRect(&source, &client, screenRegion)) return false;
@@ -178,6 +182,7 @@ bool CaptureGameFrame(GameFrame& frame, const RECT* screenRegion) {
   frame.screenH = sourceH;
   frame.width = width;
   frame.height = height;
+  frame.clientHeight = clientH;
   frame.toScreenX = sourceW / static_cast<double>(width);
   frame.toScreenY = sourceH / static_cast<double>(height);
   frame.bgra.resize(static_cast<size_t>(width) * height);

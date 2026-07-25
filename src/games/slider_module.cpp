@@ -5,6 +5,7 @@
 #include "../app/app_runtime.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -103,6 +104,7 @@ struct CaptureFrame {
   double toScreenX = 1.0;
   double toScreenY = 1.0;
   double analysisGeometryScale = 1.0;
+  double screenGeometryScale = 1.0;
   std::vector<uint32_t> bgra;
 };
 
@@ -170,6 +172,7 @@ std::atomic<int> g_cursorY{0};
 std::atomic<int> g_cursorTargetY{0};
 std::atomic<bool> g_cursorInZone{false};
 std::atomic<int> g_cursorBar{0};
+thread_local std::vector<int> g_rowCountScratch;
 
 // All tunable pixel constants are authored for a 1080p game image.
 // Runtime geometry follows the GTA client height, including windowed mode.
@@ -261,26 +264,28 @@ void PostStatus(const std::wstring& text) {
   }
 }
 
-uint8_t R(uint32_t px) { return static_cast<uint8_t>((px >> 16) & 0xff); }
-uint8_t G(uint32_t px) { return static_cast<uint8_t>((px >> 8) & 0xff); }
-uint8_t B(uint32_t px) { return static_cast<uint8_t>(px & 0xff); }
-
-bool IsRed(uint32_t px) {
-  const int r = R(px), g = G(px), b = B(px);
+inline bool IsRed(uint32_t px) {
+  const int r = static_cast<int>((px >> 16) & 0xff);
+  const int g = static_cast<int>((px >> 8) & 0xff);
+  const int b = static_cast<int>(px & 0xff);
   return r >= 165 && g <= 95 && b <= 95 && r >= g + 70 && r >= b + 70;
 }
 
-bool IsWhite(uint32_t px) {
-  const int r = R(px), g = G(px), b = B(px);
+inline bool IsWhite(uint32_t px) {
+  const int r = static_cast<int>((px >> 16) & 0xff);
+  const int g = static_cast<int>((px >> 8) & 0xff);
+  const int b = static_cast<int>(px & 0xff);
   return r >= 210 && g >= 210 && b >= 210 && std::abs(r - g) <= 38 && std::abs(r - b) <= 38;
 }
 
-bool IsYellow(uint32_t px) {
-  const int r = R(px), g = G(px), b = B(px);
+inline bool IsYellow(uint32_t px) {
+  const int r = static_cast<int>((px >> 16) & 0xff);
+  const int g = static_cast<int>((px >> 8) & 0xff);
+  const int b = static_cast<int>(px & 0xff);
   return r >= 185 && g >= 145 && b <= 95 && r >= b + 90 && g >= b + 55 && std::abs(r - g) <= 95;
 }
 
-bool CaptureScreenRegion(CaptureFrame& frame, const RectI* region) {
+bool CaptureScreenRegion(CaptureFrame& frame, const RectI* region, const RECT* sessionClient = nullptr) {
   RECT requested{};
   const RECT* requestedPtr = nullptr;
   if (region) {
@@ -288,17 +293,23 @@ bool CaptureScreenRegion(CaptureFrame& frame, const RectI* region) {
     requestedPtr = &requested;
   }
   gta5::capture::GameFrame captured;
-  if (!gta5::capture::CaptureGameFrame(captured, requestedPtr)) return false;
-  RECT game{};
-  if (!gta5::capture::GetGameClientRect(game)) return false;
+  captured.bgra = std::move(frame.bgra);
+  const bool capturedOk = sessionClient
+                              ? gta5::capture::CaptureGameFrameFromClientRect(captured, *sessionClient, requestedPtr)
+                              : gta5::capture::CaptureGameFrame(captured, requestedPtr);
+  if (!capturedOk) {
+    frame.bgra = std::move(captured.bgra);
+    return false;
+  }
   frame.x = captured.screenX;
   frame.y = captured.screenY;
   frame.w = captured.width;
   frame.h = captured.height;
   frame.toScreenX = captured.toScreenX;
   frame.toScreenY = captured.toScreenY;
-  const int gameHeight = static_cast<int>(game.bottom - game.top);
+  const int gameHeight = captured.clientHeight;
   frame.analysisGeometryScale = std::clamp(std::min(gameHeight, 1080) / kBaselineScreenHeightPx, 0.45, 2.25);
+  frame.screenGeometryScale = std::clamp(gameHeight / kBaselineScreenHeightPx, 0.45, 2.25);
   frame.bgra = std::move(captured.bgra);
   return true;
 }
@@ -332,7 +343,8 @@ RedBar LocateRedBar(const CaptureFrame& f) {
   const int cy1 = std::max(0, f.h / 12);
   const int cy2 = std::min(f.h, f.h - f.h / 12);
 
-  std::vector<int> rowCount(f.h, 0);
+  auto& rowCount = g_rowCountScratch;
+  rowCount.assign(f.h, 0);
   for (int y = cy1; y < cy2; ++y) {
     int count = 0;
     for (int x = cx1; x < cx2; ++x) {
@@ -420,7 +432,8 @@ std::vector<BarMeasure> LocateWhiteBars(const CaptureFrame& f, const RedBar& red
   for (auto [x1, x2] : xRuns) {
     if (x2 - x1 + 1 > ScaledPx(80, scale)) continue;
 
-    std::vector<int> rowCount(f.h, 0);
+    auto& rowCount = g_rowCountScratch;
+    rowCount.assign(f.h, 0);
     const int width = x2 - x1 + 1;
     for (int y = roi.y; y < roi.y + roi.h; ++y) {
       int count = 0;
@@ -493,7 +506,8 @@ bool MeasureBarAtX(const CaptureFrame& f, int x1, int x2, int y1, int y2, double
   y2 = std::clamp(y2, 0, f.h - 1);
   if (x2 <= x1 || y2 <= y1) return false;
 
-  std::vector<int> rowCount(f.h, 0);
+  auto& rowCount = g_rowCountScratch;
+  rowCount.assign(f.h, 0);
   const int width = x2 - x1 + 1;
   for (int y = y1; y <= y2; ++y) {
     int count = 0;
@@ -595,7 +609,8 @@ bool MeasureYellowGapForBar(const CaptureFrame& f, const RedBar& red, int index,
   const int y2 = std::min(f.h - 1, centerY + ScaledPx(320, localScale));
   if (cellRight < 0 || cellLeft >= f.w || y2 <= y1) return false;
 
-  std::vector<int> rowCount(f.h, 0);
+  auto& rowCount = g_rowCountScratch;
+  rowCount.assign(f.h, 0);
   const int scanX1 = std::clamp(cellLeft, 0, f.w - 1);
   const int scanX2 = std::clamp(cellRight, 0, f.w - 1);
   for (int y = y1; y <= y2; ++y) {
@@ -647,10 +662,12 @@ bool MeasureYellowGapForBar(const CaptureFrame& f, const RedBar& red, int index,
   return true;
 }
 
-YellowMeasure FindActiveYellowMeasure(const CaptureFrame& f, const RedBar& red, const SearchCells& cells, double scale) {
+YellowMeasure FindActiveYellowMeasure(const CaptureFrame& f, const RedBar& red, const SearchCells& cells, double scale,
+                                      const std::array<bool, 8>* skip = nullptr) {
   YellowMeasure best;
   if (!red.ok || !cells.ok || cells.xRanges.size() != 8) return best;
   for (int i = 0; i < 8; ++i) {
+    if (skip && (*skip)[i]) continue;
     YellowMeasure m;
     if (MeasureYellowGapForBar(f, red, i, cells.xRanges[i].first, cells.xRanges[i].second, scale, m)) {
       if (!best.ok || m.score > best.score) best = m;
@@ -661,11 +678,16 @@ YellowMeasure FindActiveYellowMeasure(const CaptureFrame& f, const RedBar& red, 
   return best;
 }
 
-YellowMeasure FindActiveYellowMeasureCandidates(const CaptureFrame& f, const RedBar& red, const SearchCells& cells, const std::vector<int>& candidates, double scale) {
+YellowMeasure FindActiveYellowMeasureCandidates(const CaptureFrame& f, const RedBar& red, const SearchCells& cells,
+                                                const std::array<int, 3>& candidates, double scale,
+                                                std::array<bool, 8>& scanned) {
   YellowMeasure best;
+  scanned.fill(false);
   if (!red.ok || !cells.ok || cells.xRanges.size() != 8) return best;
   for (int rawIndex : candidates) {
     const int i = std::clamp(rawIndex, 0, 7);
+    if (scanned[i]) continue;
+    scanned[i] = true;
     YellowMeasure m;
     if (MeasureYellowGapForBar(f, red, i, cells.xRanges[i].first, cells.xRanges[i].second, scale, m)) {
       if (!best.ok || m.score > best.score) best = m;
@@ -797,19 +819,10 @@ double EstimateVelocity(const TrackSlot& slot) {
   double sumW = 0.0;
   double sumT = 0.0;
   double sumE = 0.0;
-  std::vector<double> times;
-  std::vector<double> errors;
-  std::vector<double> weights;
-  times.reserve(slot.history.size() - begin);
-  errors.reserve(slot.history.size() - begin);
-  weights.reserve(slot.history.size() - begin);
   for (size_t i = begin; i < slot.history.size(); ++i) {
     const double t = std::chrono::duration<double>(slot.history[i].time - tLast).count();
     const double recency = std::clamp(1.0 + t / 0.10, 0.0, 1.0);
     const double w = 0.50 + recency * recency * 2.50;
-    times.push_back(t);
-    errors.push_back(slot.history[i].center);
-    weights.push_back(w);
     sumW += w;
     sumT += w * t;
     sumE += w * slot.history[i].center;
@@ -819,9 +832,12 @@ double EstimateVelocity(const TrackSlot& slot) {
   const double meanE = sumE / sumW;
   double num = 0.0;
   double den = 0.0;
-  for (size_t i = 0; i < times.size(); ++i) {
-    num += weights[i] * (times[i] - meanT) * (errors[i] - meanE);
-    den += weights[i] * (times[i] - meanT) * (times[i] - meanT);
+  for (size_t i = begin; i < slot.history.size(); ++i) {
+    const double t = std::chrono::duration<double>(slot.history[i].time - tLast).count();
+    const double recency = std::clamp(1.0 + t / 0.10, 0.0, 1.0);
+    const double w = 0.50 + recency * recency * 2.50;
+    num += w * (t - meanT) * (slot.history[i].center - meanE);
+    den += w * (t - meanT) * (t - meanT);
   }
   return den > 1e-6 ? num / den : 0.0;
 }
@@ -918,7 +934,14 @@ void WorkerLoop() {
   SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
   PostLog(L"Start: keep the game visible. Using vision to detect the red line and white bars.");
+  RECT sessionClient{};
+  if (!gta5::capture::GetGameClientRect(sessionClient)) {
+    PostStatus(L"capture failed");
+    PostLog(L"Error: cached game window geometry unavailable; stopping.");
+    return;
+  }
   std::vector<TrackSlot> tracks(8);
+  for (auto& track : tracks) track.history.reserve(32);
   auto lastEnter = std::chrono::steady_clock::now() - std::chrono::seconds(2);
   int frameNo = 0;
   int lastLoggedActive = -2;
@@ -942,6 +965,7 @@ void WorkerLoop() {
   bool finishPendingAfter8 = false;
   auto finishConfirmStart = std::chrono::steady_clock::now();
   int slowFrameStreak = 0;
+  CaptureFrame frame;
   while (!gta5::app::runtime::StopRequested()) {
     const auto frameTime = std::chrono::steady_clock::now();
     const int frameDtMs = static_cast<int>(std::round(std::chrono::duration<double, std::milli>(frameTime - lastFrameTime).count()));
@@ -959,8 +983,7 @@ void WorkerLoop() {
       continue;
     }
     slowFrameStreak = 0;
-    CaptureFrame frame;
-    if (!CaptureScreenRegion(frame, hasTrackingRegion ? &trackingRegion : nullptr)) {
+    if (!CaptureScreenRegion(frame, hasTrackingRegion ? &trackingRegion : nullptr, &sessionClient)) {
       PostStatus(L"capture failed");
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
       continue;
@@ -1004,7 +1027,7 @@ void WorkerLoop() {
     missFrames = 0;
     lockedRedScreen = a.red;
     lastBarsScreen = a.bars;
-    geometryScale = GeometryScaleFromRedScreen(a.red);
+    geometryScale = frame.screenGeometryScale;
     if (a.bars.size() >= 8) {
       knownBarXRunsScreen.clear();
       for (int i = 0; i < 8; ++i) {
@@ -1030,15 +1053,17 @@ void WorkerLoop() {
     trackingRegion.w = (maxBarX - minBarX) + ScaledPx(90, geometryScale);
     trackingRegion.h = ScaledPx(600, geometryScale);
 
-    std::vector<int> yellowCandidates;
+    std::array<int, 3> yellowCandidates{};
     if (lastYellowIndex >= 0) {
       yellowCandidates = {lastYellowIndex, lastYellowIndex - 1, lastYellowIndex + 1};
     } else {
       yellowCandidates = {expectedIndex, expectedIndex + 1, expectedIndex - 1};
     }
-    YellowMeasure yellow = FindActiveYellowMeasureCandidates(frame, a.red, searchCellsScreen, yellowCandidates, geometryScale);
+    std::array<bool, 8> scannedYellowCells{};
+    YellowMeasure yellow = FindActiveYellowMeasureCandidates(frame, a.red, searchCellsScreen, yellowCandidates,
+                                                             geometryScale, scannedYellowCells);
     if (!yellow.ok) {
-      yellow = FindActiveYellowMeasure(frame, a.red, searchCellsScreen, geometryScale);
+      yellow = FindActiveYellowMeasure(frame, a.red, searchCellsScreen, geometryScale, &scannedYellowCells);
     }
     int active = yellow.ok ? yellow.index : -1;
     if (active >= 0 && active != trackedActive) {

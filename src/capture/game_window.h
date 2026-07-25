@@ -19,11 +19,14 @@ struct GameFrame {
   int screenH = 0;
   int width = 0;
   int height = 0;
+  int clientHeight = 0;
   double toScreenX = 1.0;
   double toScreenY = 1.0;
   std::vector<std::uint32_t> bgra;
 };
 
 bool CaptureGameFrame(GameFrame& frame, const RECT* screenRegion = nullptr);
+bool CaptureGameFrameFromClientRect(GameFrame& frame, const RECT& clientRect,
+                                    const RECT* screenRegion = nullptr);
 
 }  // namespace gta5::capture

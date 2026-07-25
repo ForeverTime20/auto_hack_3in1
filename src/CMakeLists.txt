@@ -4,6 +4,8 @@ add_executable(${PROJECT_NAME} WIN32
     main.cpp
     app/app_ui.cpp
     app/app_ui.h
+    app/localization.cpp
+    app/localization.h
     app/app_runtime.cpp
     app/app_runtime.h
     capture/game_window.cpp

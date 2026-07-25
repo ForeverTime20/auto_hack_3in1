@@ -232,11 +232,41 @@ static std::vector<uint8_t> cropGray(const Frame& f, Rect r) {
     return out;
 }
 
-static std::vector<uint8_t> thresholdRange(const std::vector<uint8_t>& gray, int w, int h, int lo, int hi, bool includeBright = false) {
-    std::vector<uint8_t> mask(w * h);
-    for (int i = 0; i < w * h; ++i) {
-        uint8_t g = gray[i];
-        mask[i] = ((g >= lo && g <= hi) || (includeBright && g >= 185)) ? 1 : 0;
+static std::vector<uint8_t> fingerprintMask(const Frame& f, Rect r) {
+    r = clampRect(r, f.w, f.h);
+    std::vector<uint8_t> raw(r.w * r.h, 0);
+    if (f.bgra.size() != static_cast<size_t>(f.w) * f.h * 4) return raw;
+
+    for (int y = 0; y < r.h; ++y) {
+        for (int x = 0; x < r.w; ++x) {
+            const size_t p = (static_cast<size_t>(r.y + y) * f.w + r.x + x) * 4;
+            const int b = f.bgra[p + 0];
+            const int g = f.bgra[p + 1];
+            const int red = f.bgra[p + 2];
+            const int hi = std::max({red, g, b});
+            const int lo = std::min({red, g, b});
+            raw[y * r.w + x] = hi >= 28 && hi - lo <= 28;
+        }
+    }
+
+    // Selected components render their ridges in white, while unselected
+    // components and the target use gray. Keep both and reject the isolated
+    // background pixels by their lack of local support.
+    std::vector<uint8_t> mask(raw.size(), 0);
+    for (int y = 0; y < r.h; ++y) {
+        for (int x = 0; x < r.w; ++x) {
+            if (!raw[y * r.w + x]) continue;
+            int neighbors = 0;
+            for (int dy = -1; dy <= 1; ++dy) {
+                int ny = y + dy;
+                if (ny < 0 || ny >= r.h) continue;
+                for (int dx = -1; dx <= 1; ++dx) {
+                    int nx = x + dx;
+                    if (nx >= 0 && nx < r.w) neighbors += raw[ny * r.w + nx] ? 1 : 0;
+                }
+            }
+            mask[y * r.w + x] = neighbors >= 3;
+        }
     }
     return mask;
 }
@@ -374,9 +404,9 @@ static bool captureScreen(Frame& out) {
     out.screenW = captured.screenW; out.screenH = captured.screenH;
     out.toScreenX = captured.toScreenX;
     out.toScreenY = captured.toScreenY;
-    out.bgra.clear();
-    out.gray.resize(static_cast<size_t>(out.w) * out.h);
     const uint8_t* px = reinterpret_cast<const uint8_t*>(captured.bgra.data());
+    out.bgra.assign(px, px + static_cast<size_t>(out.w) * out.h * 4);
+    out.gray.resize(static_cast<size_t>(out.w) * out.h);
     for (int i = 0; i < out.w * out.h; ++i) {
         uint8_t b = px[i * 4 + 0], g = px[i * 4 + 1], r = px[i * 4 + 2];
         out.gray[i] = (uint8_t)((77 * r + 150 * g + 29 * b) >> 8);
@@ -588,6 +618,60 @@ static std::vector<int> edgeLinePeaks(const std::vector<int>& projection, int ba
     return chosen;
 }
 
+static std::vector<std::pair<int, int>> selectGridBorderPairs(
+        const std::vector<int>& peaks,
+        int pairCount,
+        int minSide,
+        int maxSide,
+        double expectedSide,
+        double expectedGap) {
+    std::vector<std::pair<int, int>> best;
+    std::vector<std::pair<int, int>> current;
+    double bestCost = 1e100;
+    const int minGap = std::max(1, (int)std::lround(expectedGap * 0.25));
+    const int maxGap = std::max(minGap, (int)std::lround(expectedGap * 2.5));
+
+    std::function<void(int, double)> search = [&](int firstIndex, double cost) {
+        if ((int)current.size() == pairCount) {
+            if (cost < bestCost) {
+                bestCost = cost;
+                best = current;
+            }
+            return;
+        }
+
+        const int pairsLeft = pairCount - (int)current.size();
+        if ((int)peaks.size() - firstIndex < pairsLeft * 2) return;
+
+        for (int leftIndex = firstIndex; leftIndex + 1 < (int)peaks.size(); ++leftIndex) {
+            if (!current.empty()) {
+                const int gap = peaks[leftIndex] - current.back().second;
+                if (gap < minGap) continue;
+                if (gap > maxGap) break;
+            }
+            for (int rightIndex = leftIndex + 1; rightIndex < (int)peaks.size(); ++rightIndex) {
+                const int side = peaks[rightIndex] - peaks[leftIndex];
+                if (side < minSide) continue;
+                if (side > maxSide) break;
+
+                double nextCost = cost + std::pow((side - expectedSide) / expectedSide, 2.0);
+                if (!current.empty()) {
+                    const int gap = peaks[leftIndex] - current.back().second;
+                    nextCost += std::pow((gap - expectedGap) / expectedGap, 2.0);
+                }
+                if (nextCost >= bestCost) continue;
+
+                current.push_back({peaks[leftIndex], peaks[rightIndex]});
+                search(rightIndex + 1, nextCost);
+                current.pop_back();
+            }
+        }
+    };
+
+    search(0, 0.0);
+    return best;
+}
+
 static bool detectComponentBoxesByBorder(const Frame& f, const RoiInfo& roi, std::vector<Rect>& components, std::string* diag = nullptr) {
     Rect cb = roi.bars.components;
     Rect p = roi.panel;
@@ -620,15 +704,9 @@ static bool detectComponentBoxesByBorder(const Frame& f, const RoiInfo& roi, std
     auto xs = edgeLinePeaks(vertical, search.x, minDist, 0.45);
     auto ys = edgeLinePeaks(horizontal, search.y, minDist, 0.45);
 
-    std::vector<std::pair<int, int>> colPairs;
     int minSide = std::max(scaledPx(f, 45), (int)std::lround(cb.w * 0.16));
     int maxSide = std::max(minSide + 1, (int)std::lround(cb.w * 0.36));
-    for (int i = 0; i + 1 < (int)xs.size(); ++i) {
-        int side = xs[i + 1] - xs[i];
-        if (minSide <= side && side <= maxSide) {
-            colPairs.push_back({xs[i], xs[i + 1]});
-        }
-    }
+    auto colPairs = selectGridBorderPairs(xs, 2, minSide, maxSide, cb.w * 0.255, cb.w * 0.05);
 
     if (colPairs.size() != 2) {
         if (diag) {
@@ -643,13 +721,13 @@ static bool detectComponentBoxesByBorder(const Frame& f, const RoiInfo& roi, std
     for (auto [a, b] : colPairs) avgW += b - a;
     avgW /= colPairs.size();
 
-    std::vector<std::pair<int, int>> rowPairs;
-    for (int i = 0; i + 1 < (int)ys.size(); ++i) {
-        int side = ys[i + 1] - ys[i];
-        if (side >= avgW * 0.72 && side <= avgW * 1.35) {
-            rowPairs.push_back({ys[i], ys[i + 1]});
-        }
-    }
+    auto rowPairs = selectGridBorderPairs(
+        ys,
+        4,
+        (int)std::lround(avgW * 0.72),
+        (int)std::lround(avgW * 1.35),
+        avgW,
+        avgW * 0.20);
 
     if (rowPairs.size() != 4) {
         if (diag) {
@@ -810,7 +888,7 @@ static double matchScoreCoarse(const std::vector<uint8_t>& target, const Integra
     if (cvar < 1e-6) return -1.0;
 
     double best = -1.0;
-    int step = 2;
+    int step = tw <= 100 ? 1 : 2;
     for (int y0 = 0; y0 <= th - ch; y0 += step) {
         for (int x0 = 0; x0 <= tw - cw; x0 += step) {
             double tsum = (double)targetIntegral.rectSum(x0, y0, cw, ch);
@@ -831,40 +909,71 @@ static double matchScoreCoarse(const std::vector<uint8_t>& target, const Integra
 }
 
 static std::vector<double> answerScores(const Frame& f, Rect target, const std::vector<Rect>& components) {
-    target = padRect(target, f.w, f.h, 0.02);
-    auto tg = cropGray(f, target);
-    auto tm = thresholdRange(tg, target.w, target.h, 25, 180, true);
+    int targetInset = std::max(1, (int)std::lround(std::min(target.w, target.h) * 0.02));
+    target = clampRect(
+        {target.x + targetInset, target.y + targetInset,
+         target.w - targetInset * 2, target.h - targetInset * 2},
+        f.w, f.h);
+    auto tm = fingerprintMask(f, target);
     int down = 3;
     int dtw = std::max(1, target.w / down), dth = std::max(1, target.h / down);
     tm = resizeMaskNearest(tm, target.w, target.h, dtw, dth);
     auto targetIntegral = makeIntegralMask(tm, dtw, dth);
 
-    std::vector<double> scores;
-    const double scales[] = {1.0, 1.15, 1.3, 1.45};
+    struct ComponentMask {
+        std::vector<uint8_t> pixels;
+        int w = 0;
+        int h = 0;
+    };
+
+    std::vector<ComponentMask> masks;
+    masks.reserve(components.size());
     for (Rect cr : components) {
-        cr = padRect(cr, f.w, f.h, 0.02);
-        auto cg = cropGray(f, cr);
-        auto cm = thresholdRange(cg, cr.w, cr.h, 25, 180, true);
+        int inset = std::max(1, (int)std::lround(std::min(cr.w, cr.h) * 0.05));
+        cr = clampRect({cr.x + inset, cr.y + inset, cr.w - inset * 2, cr.h - inset * 2}, f.w, f.h);
+        auto cm = fingerprintMask(f, cr);
         int cw = cr.w, ch = cr.h;
         trimMask(cm, cw, ch);
         int baseW = std::max(1, cw / down), baseH = std::max(1, ch / down);
         cm = resizeMaskNearest(cm, cw, ch, baseW, baseH);
         trimMask(cm, baseW, baseH);
+        masks.push_back({std::move(cm), baseW, baseH});
+    }
 
-        double best = -1.0;
-        for (double s : scales) {
-            int sw = std::max(scaledPx(f, 8), (int)std::lround(baseW * s));
-            int sh = std::max(scaledPx(f, 8), (int)std::lround(baseH * s));
-            auto sm = resizeMaskNearest(cm, baseW, baseH, sw, sh);
-            best = std::max(best, matchScoreCoarse(tm, targetIntegral, dtw, dth, sm, sw, sh));
+    // All eight candidates are rendered from the same source sheet, so the
+    // four matching fragments must share one scale. Allowing every candidate
+    // to choose its own scale lets a decoy imitate unrelated target ridges.
+    const double scales[] = {1.0, 1.15, 1.3, 1.45};
+    std::vector<double> scores(masks.size(), -1.0);
+    double bestScaleScore = -1e100;
+    for (double scale : scales) {
+        std::vector<double> scaleScores;
+        scaleScores.reserve(masks.size());
+        for (const auto& mask : masks) {
+            int sw = std::max(scaledPx(f, 8), (int)std::lround(mask.w * scale));
+            int sh = std::max(scaledPx(f, 8), (int)std::lround(mask.h * scale));
+            auto sm = resizeMaskNearest(mask.pixels, mask.w, mask.h, sw, sh);
+            scaleScores.push_back(matchScoreCoarse(tm, targetIntegral, dtw, dth, sm, sw, sh));
         }
-        scores.push_back(best);
+
+        auto ranked = scaleScores;
+        std::sort(ranked.begin(), ranked.end(), std::greater<double>());
+        double scaleScore = std::accumulate(
+            ranked.begin(), ranked.begin() + std::min<size_t>(4, ranked.size()), 0.0);
+        if (scaleScore > bestScaleScore) {
+            bestScaleScore = scaleScore;
+            scores = std::move(scaleScores);
+        }
     }
     return scores;
 }
 
 static uint64_t targetFingerprintHash(const Frame& f, Rect target) {
-    target = clampRect(target, f.w, f.h);
+    int inset = std::max(1, (int)std::lround(std::min(target.w, target.h) * 0.02));
+    target = clampRect(
+        {target.x + inset, target.y + inset,
+         target.w - inset * 2, target.h - inset * 2},
+        f.w, f.h);
     uint64_t hash = 1469598103934665603ull;
     int stepX = std::max(1, target.w / 48);
     int stepY = std::max(1, target.h / 64);
@@ -1389,62 +1498,57 @@ static void drawOverlay(HDC hdc) {
 
     if (!s.visible) return;
     int refBlock = s.blocks.empty() ? std::max(1, s.target.w / 3) : std::max(1, s.blocks.front().rect.w);
-    int blockPen = std::max(1, (int)std::lround(refBlock / 30.0));
-    int targetPen = std::max(1, (int)std::lround(refBlock / 40.0));
+    int blockPen = std::max(1, (int)std::lround(refBlock / 60.0));
+    int targetPen = blockPen;
     int dot = std::max(4, (int)std::lround(refBlock * 0.10));
     int dotMargin = std::max(2, (int)std::lround(refBlock * 0.05));
     HPEN green = CreatePen(PS_SOLID, blockPen, RGB(0, 255, 0));
     HPEN red = CreatePen(PS_SOLID, blockPen, RGB(255, 50, 50));
-    HPEN cyan = CreatePen(PS_SOLID, blockPen, RGB(0, 210, 255));
     HPEN magenta = CreatePen(PS_SOLID, targetPen, RGB(255, 0, 255));
     HBRUSH hollow = (HBRUSH)GetStockObject(HOLLOW_BRUSH);
     HBRUSH yellow = CreateSolidBrush(RGB(255, 230, 0));
+    HBRUSH pink = CreateSolidBrush(RGB(255, 70, 190));
     SelectObject(hdc, hollow);
     SetBkMode(hdc, TRANSPARENT);
 
     SelectObject(hdc, magenta);
-    Rectangle(hdc, s.target.x - gVirtualX, s.target.y - gVirtualY, s.target.x + s.target.w - gVirtualX, s.target.y + s.target.h - gVirtualY);
+    Rectangle(
+        hdc,
+        s.target.x - gVirtualX,
+        s.target.y - gVirtualY,
+        s.target.x + s.target.w - gVirtualX,
+        s.target.y + s.target.h - gVirtualY);
 
     for (const auto& b : s.blocks) {
         int x = b.rect.x - gVirtualX, y = b.rect.y - gVirtualY;
         SelectObject(hdc, b.correct ? green : red);
-        int inset = std::max(1, b.rect.w / 24);
-        Rectangle(hdc, x + inset, y + inset, x + b.rect.w - inset, y + b.rect.h - inset);
+        Rectangle(hdc, x, y, x + b.rect.w, y + b.rect.h);
         if (b.cursor) {
-            SelectObject(hdc, cyan);
-            int cy = y + b.rect.h / 2;
-            int arrow = std::max(6, b.rect.w / 6);
-            int wing = std::max(3, b.rect.w / 14);
-            int tipPad = std::max(1, inset / 2);
+            SelectObject(hdc, pink);
+            int markerTop = y + (b.rect.h - dot) / 2;
+            int markerGap = std::max(dot, dotMargin * 2);
+            if (b.selected) markerGap += dot + dotMargin;
             bool leftColumn = b.index % 2 == 1;
-            if (leftColumn) {
-                int tipX = x + inset + tipPad;
-                int tailX = tipX - arrow;
-                MoveToEx(hdc, tailX, cy, nullptr);
-                LineTo(hdc, tipX, cy);
-                MoveToEx(hdc, tipX, cy, nullptr);
-                LineTo(hdc, tipX - wing, cy - wing);
-                MoveToEx(hdc, tipX, cy, nullptr);
-                LineTo(hdc, tipX - wing, cy + wing);
-            } else {
-                int tipX = x + b.rect.w - inset - tipPad;
-                int tailX = tipX + arrow;
-                MoveToEx(hdc, tailX, cy, nullptr);
-                LineTo(hdc, tipX, cy);
-                MoveToEx(hdc, tipX, cy, nullptr);
-                LineTo(hdc, tipX + wing, cy - wing);
-                MoveToEx(hdc, tipX, cy, nullptr);
-                LineTo(hdc, tipX + wing, cy + wing);
-            }
+            int markerLeft = leftColumn
+                ? x - markerGap - dot
+                : x + b.rect.w + markerGap;
+            Ellipse(hdc, markerLeft, markerTop, markerLeft + dot, markerTop + dot);
+            SelectObject(hdc, hollow);
         }
         if (b.selected) {
             SelectObject(hdc, yellow);
-            Ellipse(hdc, x + dotMargin, y + b.rect.h - dot - dotMargin, x + dotMargin + dot, y + b.rect.h - dotMargin);
+            int markerTop = y + (b.rect.h - dot) / 2;
+            int markerGap = std::max(dot, dotMargin * 2);
+            bool leftColumn = b.index % 2 == 1;
+            int markerLeft = leftColumn
+                ? x - markerGap - dot
+                : x + b.rect.w + markerGap;
+            Ellipse(hdc, markerLeft, markerTop, markerLeft + dot, markerTop + dot);
             SelectObject(hdc, hollow);
         }
     }
 
-    DeleteObject(green); DeleteObject(red); DeleteObject(cyan); DeleteObject(magenta); DeleteObject(yellow);
+    DeleteObject(green); DeleteObject(red); DeleteObject(magenta); DeleteObject(yellow); DeleteObject(pink);
 }
 
 static LRESULT CALLBACK overlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -1523,7 +1627,9 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             if (gStatusText) SetWindowTextW(gStatusText, text->c_str());
             std::ofstream log("debug.log", std::ios::app);
-            std::string narrow(text->begin(), text->end());
+            std::string narrow;
+            narrow.reserve(text->size());
+            for (wchar_t ch : *text) narrow.push_back(static_cast<char>(ch));
             log << narrow << "\n";
             return 0;
         }

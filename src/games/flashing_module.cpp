@@ -554,7 +554,7 @@ static bool FindSignalRepeaterBar(const ScreenShot& shot, const std::vector<Whit
         bool belowTopBoxes = b.y > screenH * 16 / 100;
         bool notTooLow = b.y < screenH * 34 / 100;
         bool wideEnough = b.w > ScalePx(537, screenH);
-        if (!belowTopBoxes || !notTooLow || !wideEnough || b.score < 28) continue;
+        if (!belowTopBoxes || !notTooLow || !wideEnough || b.score < 25) continue;
 
         int rank = b.w * 3 + b.y * 6;
         if (rank > bestRank) {
