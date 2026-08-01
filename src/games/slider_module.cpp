@@ -3,6 +3,7 @@
 #include "../capture/game_window.h"
 #include "../app/app_ui.h"
 #include "../app/app_runtime.h"
+#include "../input/key_input.h"
 
 #include <algorithm>
 #include <array>
@@ -763,37 +764,6 @@ FrameAnalysis AnalyzeLockedGeometry(const CaptureFrame& f, const RedBar& lockedR
   return analysis;
 }
 
-void PressEnter() {
-  constexpr WORD kMainEnterScanCode = 0x1C;
-
-  INPUT down{};
-  down.type = INPUT_KEYBOARD;
-  down.ki.wScan = kMainEnterScanCode;
-  down.ki.dwFlags = KEYEVENTF_SCANCODE;
-  SendInput(1, &down, sizeof(INPUT));
-
-  Sleep(42);
-
-  INPUT up{};
-  up.type = INPUT_KEYBOARD;
-  up.ki.wScan = kMainEnterScanCode;
-  up.ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
-  SendInput(1, &up, sizeof(INPUT));
-}
-
-void WaitUntilPrecise(std::chrono::steady_clock::time_point target) {
-  while (!gta5::app::runtime::StopRequested()) {
-    const auto now = std::chrono::steady_clock::now();
-    if (now >= target) break;
-    const auto remain = target - now;
-    if (remain > std::chrono::milliseconds(2)) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    } else {
-      std::this_thread::yield();
-    }
-  }
-}
-
 bool IsMoving(const TrackSlot& slot) {
   if (slot.history.size() < 4) return false;
   const size_t begin = slot.history.size() > 6 ? slot.history.size() - 6 : 0;
@@ -1170,9 +1140,8 @@ void WorkerLoop() {
     if (pressReady) {
       const auto predictedAt = sampleTime + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                                             std::chrono::duration<double>(pressDelaySec));
-      WaitUntilPrecise(predictedAt);
-      PressEnter();
-      lastEnter = std::chrono::steady_clock::now();
+      gta5::input::QueueImmediate({0x1C, false}, predictedAt);
+      lastEnter = predictedAt;
       std::wstringstream ss;
       ss << L"Press Enter: bar=" << (active + 1) << L" schedErr=" << static_cast<int>(std::round(error)) << L"px";
       PostLog(ss.str());
@@ -1194,7 +1163,6 @@ void WorkerLoop() {
         finishPendingAfter8 = true;
         finishConfirmStart = std::chrono::steady_clock::now();
       }
-      std::this_thread::sleep_for(std::chrono::milliseconds(15));
       ++frameNo;
       continue;
     }

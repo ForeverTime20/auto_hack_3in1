@@ -55,3 +55,9 @@ bool RunSession(const std::function<bool()>& stopRequested,
                 const std::function<void(const std::wstring&)>& log);
 LRESULT CALLBACK OverlayWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 }  // namespace gta5::games::sort_fingerprint
+
+namespace gta5::games::fleeca {
+bool DetectInGame();
+bool RunSession(const std::function<bool()>& stopRequested,
+                const std::function<void(const std::wstring&)>& status);
+}  // namespace gta5::games::fleeca

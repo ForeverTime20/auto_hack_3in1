@@ -173,6 +173,8 @@ bool CaptureGameFrameFromClientRect(GameFrame& frame, const RECT& client, const 
   SetStretchBltMode(gCapture.memory, COLORONCOLOR);
   const BOOL copied = StretchBlt(gCapture.memory, 0, 0, width, height, screen,
                                  source.left, source.top, sourceW, sourceH, SRCCOPY);
+  LARGE_INTEGER capturedAt{};
+  QueryPerformanceCounter(&capturedAt);
   ReleaseDC(nullptr, screen);
   if (!copied) return false;
 
@@ -183,6 +185,7 @@ bool CaptureGameFrameFromClientRect(GameFrame& frame, const RECT& client, const 
   frame.width = width;
   frame.height = height;
   frame.clientHeight = clientH;
+  frame.captureQpc = capturedAt.QuadPart;
   frame.toScreenX = sourceW / static_cast<double>(width);
   frame.toScreenY = sourceH / static_cast<double>(height);
   frame.bgra.resize(static_cast<size_t>(width) * height);

@@ -1,6 +1,6 @@
 #include "../capture/game_window.h"
 #include "games.h"
-#include "../app/app_ui.h"
+#include "../input/key_input.h"
 
 #include <windows.h>
 
@@ -744,35 +744,7 @@ std::wstring keyPlanText(const Plan& plan) {
     return out.str();
 }
 
-constexpr int kKeyHoldMs = 30;
-constexpr int kKeyGapMs = 35;
 constexpr int kVerificationDelayMs = 350;
-
-bool sendPlan(const Plan& plan, HWND expectedForeground,
-              int keyHoldMs = kKeyHoldMs, int keyGapMs = kKeyGapMs) {
-    const auto keyHold = std::chrono::milliseconds(std::max(0, keyHoldMs));
-    const auto keyGap = std::chrono::milliseconds(std::max(0, keyGapMs));
-    if (GetForegroundWindow() != expectedForeground) return false;
-    for (WORD key : plan.keys) {
-        if (GetForegroundWindow() != expectedForeground) return false;
-        const WORD scanCode = static_cast<WORD>(MapVirtualKeyW(key, MAPVK_VK_TO_VSC));
-        if (!scanCode) return false;
-        INPUT keyDown{};
-        keyDown.type = INPUT_KEYBOARD;
-        keyDown.ki.wScan = scanCode;
-        keyDown.ki.dwFlags = KEYEVENTF_SCANCODE;
-        if (SendInput(1, &keyDown, sizeof(INPUT)) != 1) return false;
-        std::this_thread::sleep_for(keyHold);
-
-        INPUT keyUp{};
-        keyUp.type = INPUT_KEYBOARD;
-        keyUp.ki.wScan = scanCode;
-        keyUp.ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
-        if (SendInput(1, &keyUp, sizeof(INPUT)) != 1) return false;
-        std::this_thread::sleep_for(keyGap);
-    }
-    return true;
-}
 
 struct OverlayRow {
     RECT rect{};
@@ -966,6 +938,8 @@ bool RunSession(const std::function<bool()>& stopRequested,
     bool inputCompleted = false;
     bool waitingForNextRound = false;
     bool verificationPending = false;
+    gta5::input::Job inputJob;
+    std::uint64_t inputTargetHash = 0;
     int correctionAttempt = 0;
     int absentFrames = 0;
     auto verificationDue = Clock::time_point{};
@@ -1045,6 +1019,30 @@ bool RunSession(const std::function<bool()>& stopRequested,
                 }
             }
 
+            if (inputJob) {
+                if (inputJob.Pending()) {
+                    waitForNextFrame(frameStarted);
+                    continue;
+                }
+                if (inputJob.Succeeded()) {
+                    handledHash = inputTargetHash;
+                    inputCompleted = true;
+                    completedAnyRound = true;
+                    verificationPending = true;
+                    verificationDue = Clock::now() + std::chrono::milliseconds(kVerificationDelayMs);
+                    setStatus(L"sort_fingerprint: verifying input");
+                } else {
+                    handledHash.reset();
+                    inputCompleted = false;
+                    verificationPending = false;
+                    correctionAttempt = 0;
+                    log(L"sort_fingerprint: foreground changed or input failed; retrying analysis");
+                }
+                inputJob = {};
+                waitForNextFrame(frameStarted);
+                continue;
+            }
+
             if (handledHash && (!verificationPending || Clock::now() < verificationDue)) {
                 waitForNextFrame(frameStarted);
                 continue;
@@ -1084,24 +1082,12 @@ bool RunSession(const std::function<bool()>& stopRequested,
                 verificationPending = false;
                 setStatus(L"sort_fingerprint: round complete");
             } else {
-                const int holdMs = gta5::app::ui::TapHoldMs();
-                const int gapMs = gta5::app::ui::TapGapMs();
-                const auto sendStarted = Clock::now();
-                if (sendPlan(plan, foreground, holdMs, gapMs)) {
-                    handledHash = result.targetHash;
-                    inputCompleted = true;
-                    completedAnyRound = true;
-                    verificationPending = true;
-                    verificationDue = sendStarted + std::chrono::milliseconds(
-                        static_cast<long long>(plan.keys.size()) * (holdMs + gapMs) + kVerificationDelayMs);
-                    setStatus(L"sort_fingerprint: verifying input");
-                } else {
-                    handledHash.reset();
-                    inputCompleted = false;
-                    verificationPending = false;
-                    correctionAttempt = 0;
-                    log(L"sort_fingerprint: foreground changed or input failed; retrying analysis");
-                }
+                std::vector<gta5::input::Key> keys;
+                keys.reserve(plan.keys.size());
+                for (WORD key : plan.keys) keys.push_back(gta5::input::Key::FromVirtualKey(key));
+                inputTargetHash = result.targetHash;
+                inputJob = gta5::input::QueueSequence(keys, foreground);
+                setStatus(L"sort_fingerprint: verifying input");
             }
         } catch (const std::exception& error) {
             const std::string what = error.what();
@@ -1117,6 +1103,7 @@ bool RunSession(const std::function<bool()>& stopRequested,
         waitForNextFrame(frameStarted);
     }
 
+    gta5::input::CancelAll();
     ClearOverlay();
     return completedAnyRound;
 }

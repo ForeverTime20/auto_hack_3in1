@@ -1,8 +1,11 @@
 add_library(games STATIC
+    ../input/key_input.cpp
+    ../input/key_input.h
     slider_module.cpp
     flashing_module.cpp
     choose_fingerprint_module.cpp
     sort_fingerprint_module.cpp
+    fleeca_module.cpp
     games.h
 )
 

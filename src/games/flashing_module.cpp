@@ -9,8 +9,8 @@
 #include <dwmapi.h>
 #include <commctrl.h>
 #include "games.h"
-#include "../app/app_ui.h"
 #include "../capture/game_window.h"
+#include "../input/key_input.h"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -150,6 +150,7 @@ struct AppState {
     int levelFocusMissFrames = 0;
     UiRect levelFocus{};
     DWORD64 nextInputAt = 0;
+    gta5::input::Job inputJob;
     bool autoInputEnabled = false;
     int pendingVerifyCol = -1;
     DWORD64 finalSubmitAt = 0;
@@ -1031,41 +1032,6 @@ static bool AwaitingFinalSubmitResult() {
     return g.tracker.targetReady && g.finalSubmitAt != 0;
 }
 
-static void PressScanCode(WORD scanCode, bool extended = false) {
-    INPUT input{};
-    input.type = INPUT_KEYBOARD;
-    input.ki.wScan = scanCode;
-    input.ki.dwFlags = KEYEVENTF_SCANCODE | (extended ? KEYEVENTF_EXTENDEDKEY : 0);
-    SendInput(1, &input, sizeof(INPUT));
-    Sleep((DWORD)gta5::app::ui::TapHoldMs());
-
-    input.ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP | (extended ? KEYEVENTF_EXTENDEDKEY : 0);
-    SendInput(1, &input, sizeof(INPUT));
-}
-
-static void PressGameKey(WORD vk) {
-    switch (vk) {
-    case VK_UP:
-        PressScanCode(0x48, true);
-        break;
-    case VK_DOWN:
-        PressScanCode(0x50, true);
-        break;
-    case VK_LEFT:
-        PressScanCode(0x4B, true);
-        break;
-    case VK_RIGHT:
-        PressScanCode(0x4D, true);
-        break;
-    case VK_RETURN:
-        PressScanCode(0x1C, false);
-        break;
-    default:
-        PressScanCode(static_cast<WORD>(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC)), false);
-        break;
-    }
-}
-
 static void RecordCompletedFlash(const Pattern& p) {
     if (!p.any()) return;
     ++g.tracker.flashCount;
@@ -1097,6 +1063,21 @@ static void TickAutoInput() {
     }
 
     if (!g.autoInputEnabled || !g.tracker.targetReady) {
+        return;
+    }
+    if (g.inputJob) {
+        if (g.inputJob.Pending()) {
+            g.autoMessage = L"Sending column";
+            return;
+        }
+        if (g.inputJob.Succeeded()) {
+            g.nextInputAt = GetTickCount64() + 120;
+            g.autoMessage = L"Waiting input settle";
+        } else {
+            g.pendingVerifyCol = -1;
+            g.autoMessage = L"Input failed; retrying";
+        }
+        g.inputJob = {};
         return;
     }
     if (GetTickCount64() < g.nextInputAt) {
@@ -1159,13 +1140,11 @@ static void TickAutoInput() {
     keys.push_back(VK_RETURN);
 
     g.autoMessage = L"Sending column";
-    for (WORD key : keys) {
-        PressGameKey(key);
-        Sleep((DWORD)gta5::app::ui::TapGapMs());
-    }
-    DWORD settleMs = static_cast<DWORD>(keys.size()) *
-        ((DWORD)gta5::app::ui::TapHoldMs() + (DWORD)gta5::app::ui::TapGapMs());
-    g.nextInputAt = GetTickCount64() + settleMs + 120;
+    std::vector<gta5::input::Key> inputKeys;
+    inputKeys.reserve(keys.size());
+    for (WORD key : keys) inputKeys.push_back(gta5::input::Key::FromVirtualKey(key));
+    g.inputJob = gta5::input::QueueSequence(inputKeys);
+    g.nextInputAt = 0;
 
     g.pendingVerifyCol = selectedCol;
     if (selectedCol >= lastTargetCol) {
@@ -1184,6 +1163,7 @@ static void ClearLevelState(const wchar_t* reason) {
     g.lastSelectedIndex = -1;
     g.selectedStableFrames = 0;
     g.nextInputAt = 0;
+    g.inputJob = {};
     g.autoInputEnabled = false;
     g.pendingVerifyCol = -1;
     g.finalSubmitAt = 0;
@@ -1509,6 +1489,7 @@ static void ResetHistory() {
     g.levelFocusMissFrames = 0;
     g.levelFocus = UiRect{};
     g.nextInputAt = 0;
+    g.inputJob = {};
     g.autoInputEnabled = false;
     g.pendingVerifyCol = -1;
     g.finalSubmitAt = 0;

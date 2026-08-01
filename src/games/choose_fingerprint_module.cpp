@@ -1,8 +1,8 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include "games.h"
-#include "../app/app_ui.h"
 #include "../capture/game_window.h"
+#include "../input/key_input.h"
 #ifdef CLI_TEST
 #include <olectl.h>
 #include <gdiplus.h>
@@ -80,9 +80,9 @@ struct SolverCache {
 };
 
 struct AutomationState {
-    bool tabHolding = false;
     bool submitted = false;
     uint64_t plannedHash = 0;
+    gta5::input::Job inputJob;
 };
 
 struct FrameTiming {
@@ -116,7 +116,6 @@ static DWORD gUiThreadId = 0;
 static constexpr UINT WM_APP_LOG = WM_APP + 1;
 static constexpr UINT WM_APP_WORKER_STOPPED = WM_APP + 2;
 static constexpr DWORD kFrameDelayMs = 10;
-static constexpr DWORD kSubmitHoldMs = 2000;
 
 using Clock = std::chrono::steady_clock;
 
@@ -992,31 +991,6 @@ static uint64_t targetFingerprintHash(const Frame& f, Rect target) {
     return hash;
 }
 
-static void sendScanCode(WORD scanCode, bool keyUp = false, bool extended = false) {
-    INPUT input{};
-    input.type = INPUT_KEYBOARD;
-    input.ki.wScan = scanCode;
-    input.ki.dwFlags = KEYEVENTF_SCANCODE
-        | (keyUp ? KEYEVENTF_KEYUP : 0)
-        | (extended ? KEYEVENTF_EXTENDEDKEY : 0);
-    SendInput(1, &input, sizeof(INPUT));
-}
-
-static void tapScanCode(WORD scanCode, bool extended = false) {
-    sendScanCode(scanCode, false, extended);
-    Sleep((DWORD)gta5::app::ui::TapHoldMs());
-    sendScanCode(scanCode, true, extended);
-    Sleep((DWORD)gta5::app::ui::TapGapMs());
-}
-
-static void tapUp() { tapScanCode(0x48, true); }
-static void tapDown() { tapScanCode(0x50, true); }
-static void tapLeft() { tapScanCode(0x4B, true); }
-static void tapRight() { tapScanCode(0x4D, true); }
-static void tapEnter() { tapScanCode(0x1C, false); }
-static void tabDown() { sendScanCode(0x0F, false, false); }
-static void tabUp() { sendScanCode(0x0F, true, false); }
-
 static void markStates(const Frame& f, std::vector<BlockInfo>& blocks) {
     int bestCursor = -1, bestScore = -1;
     double bestCursorRatio = 0.0;
@@ -1050,9 +1024,7 @@ static void markStates(const Frame& f, std::vector<BlockInfo>& blocks) {
 }
 
 static void resetAutomation(AutomationState& aut) {
-    if (aut.tabHolding) {
-        tabUp();
-    }
+    gta5::input::CancelAll();
     aut = {};
 }
 
@@ -1071,35 +1043,26 @@ static int cursorIndex(const OverlayState& state) {
     return -1;
 }
 
-static void holdTabForSubmit() {
-    tabDown();
-    DWORD64 end = GetTickCount64() + kSubmitHoldMs;
-    while (gRunning.load() && GetTickCount64() < end) {
-        Sleep(25);
-    }
-    tabUp();
-}
-
-static void moveCursorFast(int& cur, int target) {
+static void appendCursorMoves(int& cur, int target, std::vector<gta5::input::Key>& keys) {
     int curRow = (cur - 1) / 2;
     int curCol = (cur - 1) % 2;
     int targetRow = (target - 1) / 2;
     int targetCol = (target - 1) % 2;
 
     while (curCol < targetCol) {
-        tapRight();
+        keys.push_back({0x4D, true});
         ++curCol;
     }
     while (curCol > targetCol) {
-        tapLeft();
+        keys.push_back({0x4B, true});
         --curCol;
     }
     while (curRow < targetRow) {
-        tapDown();
+        keys.push_back({0x50, true});
         ++curRow;
     }
     while (curRow > targetRow) {
-        tapUp();
+        keys.push_back({0x48, true});
         --curRow;
     }
     cur = target;
@@ -1109,6 +1072,22 @@ static void planAndRunAutomation(const OverlayState& state, AutomationState& aut
     if (!state.visible) {
         resetAutomation(aut);
         if (diag) *diag = "auto reset";
+        return;
+    }
+
+    if (aut.inputJob) {
+        if (aut.inputJob.Pending()) {
+            if (diag) *diag = "auto input queued";
+            return;
+        }
+        if (!aut.inputJob.Succeeded()) {
+            aut = {};
+            if (diag) *diag = "auto input canceled or failed";
+            return;
+        }
+        aut.inputJob = {};
+        aut.submitted = true;
+        if (diag) *diag = "auto plan executed";
         return;
     }
 
@@ -1138,20 +1117,24 @@ static void planAndRunAutomation(const OverlayState& state, AutomationState& aut
     }
 
     int toggles = 0;
+    std::vector<gta5::input::Key> keys;
     for (int target = 1; target <= 8; ++target) {
         if (selected[target] == correct[target]) continue;
-        moveCursorFast(cur, target);
-        tapEnter();
+        appendCursorMoves(cur, target, keys);
+        keys.push_back({0x1C, false});
         selected[target] = !selected[target];
         ++toggles;
     }
 
-    holdTabForSubmit();
-    aut.submitted = true;
+    std::vector<gta5::input::Command> commands;
+    commands.reserve(keys.size() + 1);
+    for (const auto& key : keys) commands.push_back({key, gta5::input::Action::Tap});
+    commands.push_back({{0x0F, false}, gta5::input::Action::LongPress});
+    aut.inputJob = gta5::input::QueueSequence(commands);
     aut.plannedHash = state.targetHash;
 
     if (diag) {
-        *diag = "auto plan executed toggles=" + std::to_string(toggles) + " tab=2s";
+        *diag = "auto plan queued toggles=" + std::to_string(toggles) + " tab=2s";
     }
 }
 

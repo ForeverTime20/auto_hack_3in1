@@ -10,6 +10,7 @@
 #include <propidl.h>
 
 #include <chrono>
+#include <cwchar>
 #include <memory>
 #include <string>
 #include <thread>
@@ -19,6 +20,7 @@
 #include "app/app_runtime.h"
 #include "app/localization.h"
 #include "capture/game_window.h"
+#include "input/key_input.h"
 #include "resources/resource.h"
 
 namespace {
@@ -28,6 +30,17 @@ std::wstring T(const char* key) { return gta5::app::l10n::Text(key); }
 constexpr UINT kMsgLog = WM_APP + 1;
 constexpr UINT kMsgStatus = WM_APP + 2;
 constexpr UINT kMsgWorkerDone = WM_APP + 3;
+
+DWORD ElevatedRestartParentId(const wchar_t* commandLine) {
+  constexpr wchar_t prefix[] = L"--elevated-restart=";
+  if (!commandLine) return 0;
+  while (*commandLine == L' ' || *commandLine == L'\t') ++commandLine;
+  if (wcsncmp(commandLine, prefix, std::size(prefix) - 1) != 0) return 0;
+
+  wchar_t* end = nullptr;
+  const unsigned long processId = wcstoul(commandLine + std::size(prefix) - 1, &end, 10);
+  return processId && end && *end == L'\0' ? static_cast<DWORD>(processId) : 0;
+}
 
 HWND g_host = nullptr;
 HICON g_appIcon = nullptr;
@@ -44,6 +57,7 @@ enum class GameKind {
   Flashing,
   ChooseFingerprint,
   SortFingerprint,
+  Fleeca,
 };
 
 std::wstring GameName(GameKind game) {
@@ -56,6 +70,8 @@ std::wstring GameName(GameKind game) {
       return T("game.choose_fingerprint");
     case GameKind::SortFingerprint:
       return T("game.sort_fingerprint");
+    case GameKind::Fleeca:
+      return T("game.fleeca");
     default:
       return T("game.none");
   }
@@ -73,6 +89,7 @@ GameKind DetectGame() {
   if (gta5::games::flashing::DetectInGame()) return GameKind::Flashing;
   if (gta5::games::choose_fingerprint::DetectInGame()) return GameKind::ChooseFingerprint;
   if (gta5::games::sort_fingerprint::DetectInGame()) return GameKind::SortFingerprint;
+  if (gta5::games::fleeca::DetectInGame()) return GameKind::Fleeca;
   return GameKind::None;
 }
 
@@ -122,6 +139,21 @@ std::wstring LocalizeRuntimeStatus(const std::wstring& text) {
       {L"flashing: verifying column", "status.flashing_verify"},
       {L"flashing: reading pattern", "status.flashing_read"},
       {L"flashing: auto input", "status.flashing_input"},
+      {L"fleeca: planning route", "status.fleeca_planning"},
+      {L"fleeca: starting signal", "status.fleeca_starting"},
+      {L"fleeca: navigating", "status.fleeca_navigating"},
+      {L"fleeca: waiting for result", "status.fleeca_wait_result"},
+      {L"fleeca: detecting result", "status.fleeca_detect_result"},
+      {L"fleeca: result detected; waiting for game", "status.fleeca_result_delay"},
+      {L"fleeca: advancing", "status.fleeca_advancing"},
+      {L"fleeca: waiting for next round", "status.fleeca_wait_next"},
+      {L"fleeca: next round", "status.fleeca_next"},
+      {L"fleeca: completed", "status.fleeca_completed"},
+      {L"fleeca: capture failed", "status.capture_failed"},
+      {L"fleeca: route unavailable", "status.fleeca_route_failed"},
+      {L"fleeca: signal not detected", "status.fleeca_signal_failed"},
+      {L"fleeca: direction not confirmed", "status.fleeca_direction_failed"},
+      {L"fleeca: result not detected", "status.fleeca_result_failed"},
   };
   for (const StatusTranslation& translation : translations) {
     if (text == translation.source) return T(translation.key);
@@ -191,11 +223,18 @@ void WorkerMain() {
             [](const std::wstring& text) { PostStatus(text); },
             [](const std::wstring& text) { PostLog(text); });
         break;
+      case GameKind::Fleeca:
+        completed = gta5::games::fleeca::RunSession(
+            [] { return gta5::app::runtime::StopRequested(); },
+            [](const std::wstring& text) { PostStatus(text); });
+        break;
       default:
         break;
     }
     break;
   }
+
+  gta5::input::CancelAll();
 
   if (!completed && !gta5::app::runtime::StopRequested() && Clock::now() >= deadline) {
     PostLog(gameWindowFound ? L"timeout: no supported minigame detected in 20s"
@@ -214,6 +253,10 @@ void WorkerMain() {
 
 void StartWorker() {
   if (gta5::app::runtime::Running()) return;
+  gta5::input::CancelAll();
+  gta5::input::ConfigureSequenceTiming(
+      std::chrono::milliseconds(gta5::app::ui::TapHoldMs()),
+      std::chrono::milliseconds(gta5::app::ui::TapGapMs()));
   gta5::app::runtime::ResetStopRequest();
   gta5::games::slider::HideTransientOverlays();
   gta5::app::runtime::SetRunning(true);
@@ -231,6 +274,7 @@ void StopWorker() {
   PostStatus(T("status.stopping"));
   gta5::app::ui::Repaint();
   gta5::app::runtime::RequestStop();
+  gta5::input::CancelAll();
   HideAllGameOverlays();
   auto& worker = gta5::app::runtime::WorkerThread();
   if (worker.joinable()) worker.join();
@@ -261,7 +305,10 @@ LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       if (static_cast<int>(wp) == gta5::app::ui::HotkeyId()) {
         if (gta5::app::ui::IsListeningHotkey()) return 0;
         if (gta5::app::runtime::Running()) StopWorker();
-        else StartWorker();
+        else {
+          gta5::app::ui::CollapseHud();
+          StartWorker();
+        }
         gta5::app::ui::ShowToggleNotification(gta5::app::runtime::Running());
         return 0;
       }
@@ -393,7 +440,7 @@ void CreateGameOverlayWindows(HINSTANCE inst, const RECT& hudRect) {
 
   g_cursorOverlay = CreateWindowExW(
       WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-      L"Gta3In1CursorV2", L"Auto Hack 4in1 Cursor", WS_POPUP,
+      L"Gta3In1CursorV2", L"Auto Hack 5in1 Cursor", WS_POPUP,
       hudRect.right + 12, hudRect.top, gta5::games::slider::CursorSize(),
       gta5::games::slider::CursorSize(), nullptr, nullptr, inst, nullptr);
   gta5::games::slider::SetCursorWindow(g_cursorOverlay);
@@ -404,7 +451,7 @@ void CreateGameOverlayWindows(HINSTANCE inst, const RECT& hudRect) {
 
   g_marksOverlay = CreateWindowExW(
       WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-      L"Gta3In1MarksV2", L"Auto Hack 4in1 Marks", WS_POPUP,
+      L"Gta3In1MarksV2", L"Auto Hack 5in1 Marks", WS_POPUP,
       hudRect.right + 84, hudRect.top, 1, 1, nullptr, nullptr, inst, nullptr);
   gta5::games::slider::SetMarksWindow(g_marksOverlay);
   if (g_marksOverlay) {
@@ -414,7 +461,7 @@ void CreateGameOverlayWindows(HINSTANCE inst, const RECT& hudRect) {
 
   g_flashingOverlay = CreateWindowExW(
       WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT,
-      L"Gta3In1FlashingOverlayV2", L"Auto Hack 4in1 Flashing Overlay", WS_POPUP,
+      L"Gta3In1FlashingOverlayV2", L"Auto Hack 5in1 Flashing Overlay", WS_POPUP,
       0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN),
       nullptr, nullptr, inst, nullptr);
   gta5::games::flashing::SetOverlayWindow(g_flashingOverlay);
@@ -425,7 +472,7 @@ void CreateGameOverlayWindows(HINSTANCE inst, const RECT& hudRect) {
 
   g_chooseFingerprintOverlay = CreateWindowExW(
       WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW,
-      L"Gta3In1ChooseFingerprintOverlayV2", L"Auto Hack 4in1 Choose Fingerprint Overlay",
+      L"Gta3In1ChooseFingerprintOverlayV2", L"Auto Hack 5in1 Choose Fingerprint Overlay",
       WS_POPUP, 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN),
       nullptr, nullptr, inst, nullptr);
   gta5::games::choose_fingerprint::SetOverlayWindow(g_chooseFingerprintOverlay);
@@ -440,7 +487,7 @@ void CreateGameOverlayWindows(HINSTANCE inst, const RECT& hudRect) {
   const int virtualH = GetSystemMetrics(SM_CYVIRTUALSCREEN);
   g_sortFingerprintOverlay = CreateWindowExW(
       WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-      L"Gta3In1SortFingerprintOverlayV2", L"Auto Hack 4in1 Sort Fingerprint Overlay",
+      L"Gta3In1SortFingerprintOverlayV2", L"Auto Hack 5in1 Sort Fingerprint Overlay",
       WS_POPUP, virtualX, virtualY, virtualW, virtualH, nullptr, nullptr, inst, nullptr);
   gta5::games::sort_fingerprint::SetOverlayWindow(g_sortFingerprintOverlay);
   if (g_sortFingerprintOverlay) {
@@ -476,7 +523,7 @@ void ApplyWindowMode(HINSTANCE inst) {
 }
 
 bool CreateWindows(HINSTANCE inst) {
-  g_host = CreateWindowExW(WS_EX_TOOLWINDOW, L"Gta3In1HostV2", L"Auto Hack 3in1 Host",
+  g_host = CreateWindowExW(WS_EX_TOOLWINDOW, L"Gta3In1HostV2", L"Auto Hack 5in1 Host",
                            WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, inst, nullptr);
   if (!g_host) return false;
   ApplyWindowIcon(g_host);
@@ -488,7 +535,7 @@ bool CreateWindows(HINSTANCE inst) {
       ? WS_EX_APPWINDOW
       : WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_APPWINDOW;
   HWND hud = CreateWindowExW(hudExStyle,
-                             L"Gta3In1HudV2", L"Auto Hack 3in1 HUD",
+                             L"Gta3In1HudV2", L"Auto Hack 5in1 HUD",
                              WS_POPUP, hudRect.left, hudRect.top,
                              gta5::app::ui::HudWidth(), gta5::app::ui::HudHeight(),
                              nullptr, nullptr, inst, nullptr);
@@ -507,10 +554,20 @@ bool CreateWindows(HINSTANCE inst) {
 
 }  // namespace
 
-int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
+int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR commandLine, int) {
   SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
   g_appIcon = LoadAppIcon(inst);
   gta5::app::ui::LoadPersistentSettings();
+
+  const DWORD restartParentId = ElevatedRestartParentId(commandLine);
+  if (restartParentId) {
+    HANDLE restartParent = OpenProcess(SYNCHRONIZE, FALSE, restartParentId);
+    if (restartParent) {
+      // The old instance releases its global hotkey and mutex during shutdown.
+      WaitForSingleObject(restartParent, INFINITE);
+      CloseHandle(restartParent);
+    }
+  }
 
   g_singleInstanceMutex = CreateMutexW(nullptr, TRUE, L"Local\\AutoHack3in1SingleInstance");
   if (!g_singleInstanceMutex) {

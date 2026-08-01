@@ -20,6 +20,7 @@ enum class DelayPreset {
 void SetHostWindow(HWND hwnd);
 void SetHudWindow(HWND hwnd);
 HWND HudWindow();
+void CollapseHud();
 
 void LoadPersistentSettings();
 bool NeedsFirstLaunchSetup();

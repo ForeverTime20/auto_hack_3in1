@@ -1,6 +1,7 @@
 #include "app_ui.h"
 #include "localization.h"
 
+#include <shellapi.h>
 #include <windowsx.h>
 
 #include <algorithm>
@@ -22,7 +23,7 @@ constexpr UINT kModeChangedMessage = WM_APP + 20;
 constexpr int kHudWidth = 320;
 constexpr int kHudMiniWidth = 232;
 constexpr int kHudMiniHeight = 44;
-constexpr int kHudExpandedHeight = 292;
+constexpr int kHudExpandedHeight = 328;
 constexpr int kHudMargin = 18;
 constexpr ULONGLONG kHudAutoCollapseMs = 5000;
 
@@ -255,12 +256,15 @@ RECT VirtualDesktopRect() {
 }
 
 RECT ClampRect(RECT panel) {
-  RECT desktop = VirtualDesktopRect();
   const int width = panel.right - panel.left;
   const int height = panel.bottom - panel.top;
-  const int minLeft = desktop.left + kHudMargin;
+  MONITORINFO info{sizeof(info)};
+  const HMONITOR monitor = MonitorFromRect(&panel, MONITOR_DEFAULTTONEAREST);
+  if (!GetMonitorInfoW(monitor, &info)) info.rcMonitor = VirtualDesktopRect();
+  const RECT& desktop = info.rcMonitor;
+  const int minLeft = desktop.left;
   const int minTop = desktop.top + kHudMargin;
-  const int maxLeft = std::max(minLeft, static_cast<int>(desktop.right) - width - kHudMargin);
+  const int maxLeft = std::max(minLeft, static_cast<int>(desktop.right) - width);
   const int maxTop = std::max(minTop, static_cast<int>(desktop.bottom) - height - kHudMargin);
   panel.left = std::clamp(static_cast<int>(panel.left), minLeft, maxLeft);
   panel.top = std::clamp(static_cast<int>(panel.top), minTop, maxTop);
@@ -277,16 +281,35 @@ RECT ResidentRect() { return RECT{16, 78, 156, 106}; }
 RECT SilentRect() { return RECT{164, 78, 304, 106}; }
 RECT HotkeyRect() { return RECT{86, 124, 190, 150}; }
 RECT HotkeyActionRect() { return RECT{198, 124, 304, 150}; }
-RECT FastRect() { return RECT{16, 180, 104, 208}; }
-RECT SlowRect() { return RECT{112, 180, 200, 208}; }
-RECT CustomRect() { return RECT{208, 180, 304, 208}; }
-RECT HoldEditRect() { return RECT{66, 218, 120, 244}; }
-RECT GapEditRect() { return RECT{212, 218, 266, 244}; }
-RECT OverlayRect() { return RECT{18, 260, 38, 280}; }
-RECT OverlayHintRect() { return RECT{16, 254, 194, 286}; }
-RECT ChineseRect() { return RECT{202, 258, 248, 282}; }
-RECT EnglishRect() { return RECT{256, 258, 304, 282}; }
+RECT AdminActionRect() { return RECT{198, 160, 304, 186}; }
+RECT FastRect() { return RECT{16, 216, 104, 244}; }
+RECT SlowRect() { return RECT{112, 216, 200, 244}; }
+RECT CustomRect() { return RECT{208, 216, 304, 244}; }
+RECT HoldEditRect() { return RECT{66, 254, 120, 280}; }
+RECT GapEditRect() { return RECT{212, 254, 266, 280}; }
+RECT OverlayRect() { return RECT{18, 296, 38, 316}; }
+RECT OverlayHintRect() { return RECT{16, 290, 194, 322}; }
+RECT ChineseRect() { return RECT{202, 294, 248, 318}; }
+RECT EnglishRect() { return RECT{256, 294, 304, 318}; }
 bool Contains(RECT rect, POINT point) { return PtInRect(&rect, point) != FALSE; }
+
+bool RestartAsAdministrator(HWND owner) {
+  wchar_t executable[MAX_PATH * 4]{};
+  const DWORD length = GetModuleFileNameW(nullptr, executable, static_cast<DWORD>(std::size(executable)));
+  if (length == 0 || length >= std::size(executable)) return false;
+
+  const std::wstring parameters = L"--elevated-restart=" + std::to_wstring(GetCurrentProcessId());
+  SHELLEXECUTEINFOW execute{sizeof(execute)};
+  execute.hwnd = owner;
+  execute.lpVerb = L"runas";
+  execute.lpFile = executable;
+  execute.lpParameters = parameters.c_str();
+  execute.nShow = SW_SHOWNORMAL;
+  if (!ShellExecuteExW(&execute)) return false;
+
+  if (g_hostWnd) PostMessageW(g_hostWnd, WM_CLOSE, 0, 0);
+  return true;
+}
 
 bool GetHoverHint(POINT point, int& target, RECT& anchor, std::wstring& text) {
   struct Hint {
@@ -470,9 +493,14 @@ void DrawPanel(HDC hdc, const RECT& panel) {
     DrawSegment(hdc, HotkeyActionRect(), T(listening ? "action.confirm" : "action.change"), false,
                 accentBrush, normalBrush, accentPen);
 
+    SetTextColor(hdc, RGB(183, 196, 208));
+    DrawTextAt(hdc, 16, 164, T("admin.try_prompt"));
+    DrawSegment(hdc, AdminActionRect(), T("admin.run"), false,
+                accentBrush, normalBrush, accentPen);
+
     SelectObject(hdc, labelFont);
     SetTextColor(hdc, RGB(124, 139, 153));
-    DrawTextAt(hdc, 16, 160, T("panel.key_delay"));
+    DrawTextAt(hdc, 16, 196, T("panel.key_delay"));
     const DelayPreset preset = static_cast<DelayPreset>(g_delayPreset.load(std::memory_order_relaxed));
     SelectObject(hdc, font);
     DrawSegment(hdc, FastRect(), T("delay.fast"), preset == DelayPreset::Fast,
@@ -483,10 +511,10 @@ void DrawPanel(HDC hdc, const RECT& panel) {
                 accentBrush, normalBrush, accentPen);
 
     SetTextColor(hdc, RGB(183, 196, 208));
-    DrawTextAt(hdc, 16, 222, T("delay.hold"));
-    DrawTextAt(hdc, 126, 222, T("unit.ms"));
-    DrawTextAt(hdc, 164, 222, T("delay.gap"));
-    DrawTextAt(hdc, 272, 222, T("unit.ms"));
+    DrawTextAt(hdc, 16, 258, T("delay.hold"));
+    DrawTextAt(hdc, 126, 258, T("unit.ms"));
+    DrawTextAt(hdc, 164, 258, T("delay.gap"));
+    DrawTextAt(hdc, 272, 258, T("unit.ms"));
     const bool customDelay = preset == DelayPreset::Custom;
     DrawEditFrame(hdc, HoldEditRect(), customDelay);
     DrawEditFrame(hdc, GapEditRect(), customDelay);
@@ -495,14 +523,14 @@ void DrawPanel(HDC hdc, const RECT& panel) {
     const bool overlayOn = overlayAvailable && g_overlayEnabled.load(std::memory_order_relaxed);
     SelectObject(hdc, overlayOn ? accentBrush : normalBrush);
     SelectObject(hdc, overlayAvailable ? accentPen : disabledPen);
-    Rectangle(hdc, 18, 260, 38, 280);
+    Rectangle(hdc, 18, 296, 38, 316);
     if (overlayOn) {
-      MoveToEx(hdc, 22, 270, nullptr);
-      LineTo(hdc, 27, 275);
-      LineTo(hdc, 35, 264);
+      MoveToEx(hdc, 22, 306, nullptr);
+      LineTo(hdc, 27, 311);
+      LineTo(hdc, 35, 300);
     }
     SetTextColor(hdc, overlayAvailable ? RGB(183, 196, 208) : RGB(103, 116, 128));
-    DrawTextAt(hdc, 48, 262, T(overlayAvailable ? "overlay.show" : "overlay.silent"));
+    DrawTextAt(hdc, 48, 298, T(overlayAvailable ? "overlay.show" : "overlay.silent"));
     DrawSegment(hdc, ChineseRect(), T("language.chinese"),
                 gta5::app::l10n::CurrentLanguage() == Language::Chinese,
                 accentBrush, normalBrush, accentPen);
@@ -1004,6 +1032,12 @@ void CenterWindow(HWND hwnd, int width, int height, HWND owner = nullptr) {
 void SetHostWindow(HWND hwnd) { g_hostWnd = hwnd; }
 void SetHudWindow(HWND hwnd) { g_hudWnd = hwnd; }
 HWND HudWindow() { return g_hudWnd; }
+void CollapseHud() {
+  if (!g_hudWnd || !g_panelExpanded.load(std::memory_order_relaxed)) return;
+  HideHoverHint();
+  Collapse(g_hudWnd);
+  UpdateWindow(g_hudWnd);
+}
 void LoadPersistentSettings() { LoadSettings(); }
 bool NeedsFirstLaunchSetup() { return !g_setupComplete; }
 
@@ -1291,6 +1325,10 @@ LRESULT CALLBACK HudProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
           g_listeningHotkey.store(false, std::memory_order_relaxed);
         }
         Repaint();
+        return 0;
+      }
+      if (Contains(AdminActionRect(), pt)) {
+        RestartAsAdministrator(hwnd);
         return 0;
       }
       if (Contains(FastRect(), pt) || Contains(SlowRect(), pt)) {
