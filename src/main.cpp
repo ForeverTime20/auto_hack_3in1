@@ -173,6 +173,7 @@ void ApplyWindowIcon(HWND hwnd) {
 
 void WorkerMain() {
   using Clock = std::chrono::steady_clock;
+  gta5::app::runtime::ConfigureLatencySensitiveThread();
   PostLog(T("log.start"));
   PostStatus(T("status.search_game"));
   HideAllGameOverlays();
@@ -287,6 +288,15 @@ void StopWorker() {
 void DestroyGameOverlayWindows();
 void ApplyWindowMode(HINSTANCE inst);
 
+void ToggleAutomation() {
+  if (gta5::app::runtime::Running()) StopWorker();
+  else {
+    gta5::app::ui::CollapseHud();
+    StartWorker();
+  }
+  gta5::app::ui::ShowToggleNotification(gta5::app::runtime::Running());
+}
+
 LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
   if (msg == gta5::app::ui::ModeChangedMessage()) {
     StopWorker();
@@ -299,20 +309,38 @@ LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
   }
   switch (msg) {
     case WM_CREATE:
-      gta5::app::ui::ApplyHotkey(hwnd);
+      gta5::app::ui::RegisterRawKeyboardInput(hwnd);
       return 0;
-    case WM_HOTKEY:
-      if (static_cast<int>(wp) == gta5::app::ui::HotkeyId()) {
-        if (gta5::app::ui::IsListeningHotkey()) return 0;
-        if (gta5::app::runtime::Running()) StopWorker();
-        else {
-          gta5::app::ui::CollapseHud();
-          StartWorker();
-        }
-        gta5::app::ui::ShowToggleNotification(gta5::app::runtime::Running());
+    case WM_INPUT: {
+      UINT size = 0;
+      if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lp), RID_INPUT, nullptr, &size,
+                          sizeof(RAWINPUTHEADER)) != 0 || size == 0) {
         return 0;
       }
+      std::unique_ptr<BYTE[]> input(new BYTE[size]);
+      if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lp), RID_INPUT, input.get(), &size,
+                          sizeof(RAWINPUTHEADER)) != size) {
+        return 0;
+      }
+      const RAWINPUT& raw = *reinterpret_cast<const RAWINPUT*>(input.get());
+      if (raw.header.dwType != RIM_TYPEKEYBOARD || raw.data.keyboard.VKey == 255) return 0;
+
+      static bool hotkeyDown = false;
+      const int vk = static_cast<int>(raw.data.keyboard.VKey);
+      const bool keyUp = (raw.data.keyboard.Flags & RI_KEY_BREAK) != 0;
+      if (gta5::app::ui::IsListeningHotkey()) {
+        if (!keyUp) gta5::app::ui::CaptureHotkeyVk(vk);
+        return 0;
+      }
+      if (vk != gta5::app::ui::HotkeyVk()) return 0;
+      if (keyUp) {
+        hotkeyDown = false;
+      } else if (!hotkeyDown) {
+        hotkeyDown = true;
+        ToggleAutomation();
+      }
       return 0;
+    }
     case kMsgLog: {
       std::unique_ptr<std::wstring> text(reinterpret_cast<std::wstring*>(lp));
       OutputDebugStringW(text->c_str());
@@ -341,7 +369,6 @@ LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DESTROY:
       StopWorker();
       DestroyGameOverlayWindows();
-      UnregisterHotKey(hwnd, gta5::app::ui::HotkeyId());
       PostQuitMessage(0);
       return 0;
   }
@@ -556,6 +583,7 @@ bool CreateWindows(HINSTANCE inst) {
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR commandLine, int) {
   SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+  gta5::app::runtime::ConfigureLatencySensitiveProcess();
   g_appIcon = LoadAppIcon(inst);
   gta5::app::ui::LoadPersistentSettings();
 

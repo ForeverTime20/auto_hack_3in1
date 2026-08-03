@@ -26,9 +26,10 @@ void LoadPersistentSettings();
 bool NeedsFirstLaunchSetup();
 bool RunFirstLaunchSetup(HINSTANCE instance, HICON icon);
 void ShowNotice(HINSTANCE instance, HICON icon, const std::wstring& title, const std::wstring& message);
-void ApplyHotkey(HWND hwnd);
-int HotkeyId();
+bool RegisterRawKeyboardInput(HWND hwnd);
+int HotkeyVk();
 bool IsListeningHotkey();
+void CaptureHotkeyVk(int vk);
 std::wstring HotkeyName();
 
 bool OverlayEnabled();

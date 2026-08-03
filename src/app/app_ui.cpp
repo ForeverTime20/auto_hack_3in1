@@ -18,7 +18,6 @@ using gta5::app::l10n::Language;
 
 std::wstring T(const char* key) { return gta5::app::l10n::Text(key); }
 
-constexpr int kHotkeyToggleId = 2001;
 constexpr UINT kModeChangedMessage = WM_APP + 20;
 constexpr int kHudWidth = 320;
 constexpr int kHudMiniWidth = 232;
@@ -1103,15 +1102,23 @@ void ShowNotice(HINSTANCE instance, HICON icon, const std::wstring& title, const
   RunModalWindow(hwnd);
 }
 
-void ApplyHotkey(HWND hwnd) {
-  if (!hwnd) return;
-  UnregisterHotKey(hwnd, kHotkeyToggleId);
-  RegisterHotKey(hwnd, kHotkeyToggleId, MOD_NOREPEAT,
-                 static_cast<UINT>(g_hotkeyVk.load(std::memory_order_relaxed)));
+bool RegisterRawKeyboardInput(HWND hwnd) {
+  if (!hwnd) return false;
+  RAWINPUTDEVICE device{};
+  device.usUsagePage = 0x01;
+  device.usUsage = 0x06;
+  device.dwFlags = RIDEV_INPUTSINK;
+  device.hwndTarget = hwnd;
+  return RegisterRawInputDevices(&device, 1, sizeof(device)) == TRUE;
 }
 
-int HotkeyId() { return kHotkeyToggleId; }
+int HotkeyVk() { return g_hotkeyVk.load(std::memory_order_relaxed); }
 bool IsListeningHotkey() { return g_listeningHotkey.load(std::memory_order_relaxed); }
+void CaptureHotkeyVk(int vk) {
+  if (!g_listeningHotkey.load(std::memory_order_relaxed) || !IsValidHotkeyVk(vk)) return;
+  const int previous = g_pendingHotkeyVk.exchange(vk, std::memory_order_relaxed);
+  if (previous != vk) Repaint();
+}
 std::wstring HotkeyName() { return KeyName(g_hotkeyVk.load(std::memory_order_relaxed)); }
 bool OverlayEnabled() { return !SilentMode() && g_overlayEnabled.load(std::memory_order_relaxed); }
 void SetOverlayEnabled(bool enabled) {
@@ -1264,16 +1271,6 @@ LRESULT CALLBACK HudProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       return 0;
     case WM_TIMER:
       if (wp == 1) {
-        if (g_listeningHotkey.load(std::memory_order_relaxed)) {
-          for (int vk = 8; vk <= 254; ++vk) {
-            if (!IsValidHotkeyVk(vk)) continue;
-            if (GetAsyncKeyState(vk) & 1) {
-              const int previous = g_pendingHotkeyVk.exchange(vk, std::memory_order_relaxed);
-              if (previous != vk) Repaint();
-              break;
-            }
-          }
-        }
         if (g_panelExpanded.load(std::memory_order_relaxed) && !g_dragging &&
             !g_listeningHotkey.load(std::memory_order_relaxed) && g_lastInteractionTick != 0 &&
             GetTickCount64() - g_lastInteractionTick >= kHudAutoCollapseMs) {
@@ -1319,7 +1316,6 @@ LRESULT CALLBACK HudProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
           const int pending = g_pendingHotkeyVk.load(std::memory_order_relaxed);
           if (IsValidHotkeyVk(pending)) {
             g_hotkeyVk.store(pending, std::memory_order_relaxed);
-            ApplyHotkey(g_hostWnd);
             SaveSettings();
           }
           g_listeningHotkey.store(false, std::memory_order_relaxed);
