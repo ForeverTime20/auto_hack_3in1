@@ -1249,7 +1249,6 @@ static OverlayState analyzeFrame(const Frame& f, SolverCache& cache, std::string
         timing->minigame = roi.isMinigame;
     }
     if (!roi.isMinigame) {
-        cache = {};
         if (diag) *diag = "not in minigame: " + minigameDiag;
         if (timing) timing->analyzeMs = msSince(analyzeStart);
         return os;
@@ -1274,7 +1273,6 @@ static OverlayState analyzeFrame(const Frame& f, SolverCache& cache, std::string
     std::string roiDiag;
     phaseStart = Clock::now();
     if (!detectRois(f, roi, target, comps, &roiDiag)) {
-        cache = {};
         if (diag) *diag = "minigame found, ROI failed: " + roiDiag;
         if (timing) {
             timing->roiMs = msSince(phaseStart);
@@ -1304,7 +1302,6 @@ static OverlayState analyzeFrame(const Frame& f, SolverCache& cache, std::string
             return score > -1.5;
         });
         if (validScores < 4) {
-            cache = {};
             if (diag) *diag = "fingerprint features insufficient valid=" + std::to_string(validScores);
             if (timing) timing->analyzeMs = msSince(analyzeStart);
             return os;
@@ -1757,7 +1754,13 @@ void ClearOverlay() { publishState({}); if (gOverlayWnd) ShowWindow(gOverlayWnd,
 bool RunSession(const std::function<bool()>& stopRequested,
                 const std::function<bool()>& overlayEnabled,
                 const std::function<void(const std::wstring&)>& status) {
+  constexpr int kAutomationMissToleranceFrames = 3;
+  constexpr int kOverlayMissToleranceFrames = 8;
   std::wstring lastStatus;
+  bool overlayShown = false;
+  bool retainedUsable = false;
+  OverlayState retainedState;
+  int overlayX = 0, overlayY = 0, overlayW = 0, overlayH = 0;
   auto setStatus = [&](const std::wstring& text) {
     if (text != lastStatus) {
       lastStatus = text;
@@ -1767,11 +1770,21 @@ bool RunSession(const std::function<bool()>& stopRequested,
   auto syncOverlay = [&] {
     if (!gOverlayWnd) return;
     if (overlayEnabled()) {
-      SetWindowPos(gOverlayWnd, HWND_TOPMOST, gVirtualX, gVirtualY, gVirtualW, gVirtualH,
-                   SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    } else {
+      const bool moved = overlayX != gVirtualX || overlayY != gVirtualY
+          || overlayW != gVirtualW || overlayH != gVirtualH;
+      if (!overlayShown || moved) {
+        UINT flags = SWP_NOACTIVATE;
+        if (!overlayShown) flags |= SWP_SHOWWINDOW;
+        SetWindowPos(gOverlayWnd, HWND_TOPMOST, gVirtualX, gVirtualY, gVirtualW, gVirtualH, flags);
+        overlayX = gVirtualX; overlayY = gVirtualY;
+        overlayW = gVirtualW; overlayH = gVirtualH;
+        if (!overlayShown && retainedUsable) publishState(retainedState);
+        overlayShown = true;
+      }
+    } else if (overlayShown) {
       publishState({});
       ShowWindow(gOverlayWnd, SW_HIDE);
+      overlayShown = false;
     }
   };
   SolverCache cache;
@@ -1787,6 +1800,7 @@ bool RunSession(const std::function<bool()>& stopRequested,
   syncOverlay();
   bool completedAnyLevel = false;
   int lostFrames = 0;
+  int invalidFrames = 0;
   setStatus(L"fingerprint: locating");
   while (!stopRequested()) {
     syncOverlay();
@@ -1794,13 +1808,17 @@ bool RunSession(const std::function<bool()>& stopRequested,
     if (!captureScreen(frame)) { Sleep(30); continue; }
     OverlayState state = analyzeFrame(frame, cache, nullptr, &timing);
     if (!timing.minigame) {
+      ++invalidFrames;
       if (++lostFrames >= 15) {
         setStatus(L"fingerprint: exited");
         break;
       }
       setStatus(L"fingerprint: confirming exit");
-      resetAutomation(automation);
-      publishState({});
+      if (invalidFrames == kAutomationMissToleranceFrames) resetAutomation(automation);
+      if (invalidFrames == kOverlayMissToleranceFrames) {
+        retainedUsable = false;
+        publishState({});
+      }
       Sleep(50);
       continue;
     }
@@ -1810,11 +1828,27 @@ bool RunSession(const std::function<bool()>& stopRequested,
       setStatus(L"fingerprint: level complete");
       resetAutomation(automation);
       cache = {};
+      invalidFrames = 0;
+      retainedUsable = false;
       publishState({});
       Sleep(120);
       continue;
     }
-    publishState(overlayEnabled() ? scaleOverlayStateToScreen(frame, state) : OverlayState{});
+    if (!state.visible) {
+      ++invalidFrames;
+      if (invalidFrames == kAutomationMissToleranceFrames) resetAutomation(automation);
+      if (invalidFrames == kOverlayMissToleranceFrames) {
+        retainedUsable = false;
+        publishState({});
+      }
+      setStatus(L"fingerprint: locating");
+      Sleep(kFrameDelayMs);
+      continue;
+    }
+    invalidFrames = 0;
+    retainedState = scaleOverlayStateToScreen(frame, state);
+    retainedUsable = true;
+    if (overlayEnabled()) publishState(retainedState);
     std::string autoDiag;
     setStatus(state.visible ? L"fingerprint: auto input" : L"fingerprint: locating");
     planAndRunAutomation(state, automation, &autoDiag);

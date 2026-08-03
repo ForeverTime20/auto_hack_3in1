@@ -498,7 +498,7 @@ void CreateGameOverlayWindows(HINSTANCE inst, const RECT& hudRect) {
   }
 
   g_chooseFingerprintOverlay = CreateWindowExW(
-      WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW,
+      WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
       L"Gta3In1ChooseFingerprintOverlayV2", L"Auto Hack 5in1 Choose Fingerprint Overlay",
       WS_POPUP, 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN),
       nullptr, nullptr, inst, nullptr);
