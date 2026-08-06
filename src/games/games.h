@@ -66,3 +66,17 @@ void ResetInGameCache();
 bool RunSession(const std::function<bool()>& stopRequested,
                 const std::function<void(const std::wstring&)>& status);
 }  // namespace gta5::games::fleeca
+
+namespace gta5::games::find_number {
+bool DetectInGame();
+void ResetInGameCache();
+bool RunSession(const std::function<bool()>& stopRequested,
+                const std::function<void(const std::wstring&)>& status);
+}  // namespace gta5::games::find_number
+
+namespace gta5::games::match {
+bool DetectInGame();
+void ResetInGameCache();
+bool RunSession(const std::function<bool()>& stopRequested,
+                const std::function<void(const std::wstring&)>& status);
+}  // namespace gta5::games::match

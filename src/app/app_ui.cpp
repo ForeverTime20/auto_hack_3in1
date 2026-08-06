@@ -1193,7 +1193,7 @@ void ShowToggleNotification(bool enabled) {
   const int x = info.rcWork.left + (info.rcWork.right - info.rcWork.left - width) / 2;
   const int y = info.rcWork.bottom - height - 18;
   g_toastWnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
-                               L"Gta3In1SilentToastV1", T("notice.subtitle").c_str(), WS_POPUP,
+                               L"Gta7In1SilentToastV1", T("notice.subtitle").c_str(), WS_POPUP,
                                x, y, width, height, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
   if (!g_toastWnd) return;
   SetWindowPos(g_toastWnd, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);

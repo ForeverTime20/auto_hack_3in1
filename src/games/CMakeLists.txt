@@ -6,6 +6,8 @@ add_library(games STATIC
     choose_fingerprint_module.cpp
     sort_fingerprint_module.cpp
     fleeca_module.cpp
+    find_number_module.cpp
+    match_module.cpp
     games.h
 )
 

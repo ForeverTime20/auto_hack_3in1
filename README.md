@@ -1,12 +1,14 @@
-# Auto Hack 5in1
+# Auto Hack 7in1
 
-A Windows C++/Win32 helper for five GTA Online hacking minigames:
+A Windows C++/Win32 helper for the following GTA Online hacking minigames:
 
 - Slider
 - Signal repeater / flashing grid
 - Choose fingerprint
 - Sort fingerprint
 - Fleeca circuit breaker
+- Find the number / BruteForce
+- Signal matching
 
 The app detects the active supported minigame, shows a small HUD/overlay, and uses screen analysis plus simulated key input to complete the detected sequence.
 On activation it locates the visible GTA V client area (`GTA5_Enhanced.exe` or `GTA5.exe`), captures only that area, and downsizes it proportionally only when its height exceeds 1080 pixels.
@@ -33,11 +35,12 @@ if (-not (Get-Command $gxx -ErrorAction SilentlyContinue)) {
   $windres = "C:\mingw64\bin\windres.exe"
 }
 
-$resourceObject = Join-Path $env:TEMP "auto_hack_5in1_app_$PID.o"
+$resourceObject = Join-Path $env:TEMP "auto_hack_7in1_app_$PID.o"
 & $windres "$root\src\resources\app.rc" -I "$root\src\resources" `
   --codepage=65001 -O coff -o $resourceObject
 
-& $gxx -std=c++17 -O2 -static -static-libgcc -static-libstdc++ -municode -mwindows `
+& $gxx -std=c++17 -O2 -DUNICODE -D_UNICODE -DNOMINMAX -D_WIN32_WINNT=0x0A00 `
+  -static -static-libgcc -static-libstdc++ -municode -mwindows `
   "$root\src\main.cpp" `
   "$root\src\app\app_ui.cpp" `
   "$root\src\app\localization.cpp" `
@@ -49,9 +52,11 @@ $resourceObject = Join-Path $env:TEMP "auto_hack_5in1_app_$PID.o"
   "$root\src\games\choose_fingerprint_module.cpp" `
   "$root\src\games\sort_fingerprint_module.cpp" `
   "$root\src\games\fleeca_module.cpp" `
+  "$root\src\games\find_number_module.cpp" `
+  "$root\src\games\match_module.cpp" `
   $resourceObject `
   -lgdi32 -luser32 -lshell32 -lgdiplus -lcomctl32 -ldwmapi `
-  -o "$root\auto_hack_5in1.exe"
+  -o "$root\auto_hack_7in1.exe"
 
 Remove-Item -LiteralPath $resourceObject -Force
 ```
@@ -60,12 +65,13 @@ Remove-Item -LiteralPath $resourceObject -Force
 
 ```powershell
 $root = (Get-Location).Path
-$resourceFile = Join-Path $env:TEMP "auto_hack_5in1_app_$PID.res"
+$resourceFile = Join-Path $env:TEMP "auto_hack_7in1_app_$PID.res"
 
 rc /nologo /c 65001 /I "$root\src\resources" `
   /fo "$resourceFile" "$root\src\resources\app.rc"
 
 cl /nologo /std:c++17 /EHsc /O2 /MT /DUNICODE /D_UNICODE /DNOMINMAX `
+  /D_WIN32_WINNT=0x0A00 `
   "$root\src\main.cpp" `
   "$root\src\app\app_ui.cpp" `
   "$root\src\app\localization.cpp" `
@@ -77,9 +83,11 @@ cl /nologo /std:c++17 /EHsc /O2 /MT /DUNICODE /D_UNICODE /DNOMINMAX `
   "$root\src\games\choose_fingerprint_module.cpp" `
   "$root\src\games\sort_fingerprint_module.cpp" `
   "$root\src\games\fleeca_module.cpp" `
+  "$root\src\games\find_number_module.cpp" `
+  "$root\src\games\match_module.cpp" `
   "$resourceFile" `
   /link /SUBSYSTEM:WINDOWS `
-  /OUT:"$root\auto_hack_5in1.exe" `
+  /OUT:"$root\auto_hack_7in1.exe" `
   user32.lib gdi32.lib shell32.lib gdiplus.lib comctl32.lib dwmapi.lib
 
 Remove-Item -LiteralPath $resourceFile -Force
@@ -88,7 +96,7 @@ Remove-Item -LiteralPath $resourceFile -Force
 The compiled executable is written to:
 
 ```text
-auto_hack_5in1.exe
+auto_hack_7in1.exe
 ```
 
 ## Configuration
@@ -120,7 +128,7 @@ Delay presets are `0` for Fast (`20/20 ms`), `1` for Slow (`40/40 ms`), and `2` 
 
 ## Usage
 
-1. Build and run `auto_hack_5in1.exe`.
+1. Build and run `auto_hack_7in1.exe`.
 2. Start the target game and open a supported hacking minigame.
 3. Press the configured hotkey to start or stop detection/automation.
 4. Use the taskbar button or HUD to bring the overlay back if needed.
