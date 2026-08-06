@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstring>
 #include <cstdint>
+#include <functional>
 #include <iomanip>
 #include <mutex>
 #include <sstream>
@@ -290,10 +291,14 @@ void PostStatus(const std::wstring& text) {
 }
 
 inline bool IsRed(uint32_t px) {
-  const int r = static_cast<int>((px >> 16) & 0xff);
-  const int g = static_cast<int>((px >> 8) & 0xff);
-  const int b = static_cast<int>(px & 0xff);
-  return r >= 165 && g <= 95 && b <= 95 && r >= g + 70 && r >= b + 70;
+  const double r = static_cast<double>((px >> 16) & 0xff);
+  const double g = static_cast<double>((px >> 8) & 0xff);
+  const double b = static_cast<double>(px & 0xff);
+  const double maximum = std::max({r, g, b});
+  const double minimum = std::min({r, g, b});
+  const double chroma = maximum - minimum;
+  return maximum >= 40 && chroma >= 20 && chroma / maximum >= .25 &&
+         r == maximum && r - std::max(g, b) >= std::max(10.0, chroma * .35);
 }
 
 inline bool IsWhite(uint32_t px) {
@@ -410,6 +415,46 @@ RedBar LocateRedBar(const CaptureFrame& f) {
   }
 
   if (x2 - x1 < 240 || y2 - y1 < 4) return red;
+
+  // Moving white/yellow bars can split the coarse red component. Sample away
+  // from the vertical frame edges and keep the longest vertical red segment
+  // that intersects the coarse band.
+  const int sampleInset = std::max(3, static_cast<int>(std::lround(f.h * .025)));
+  const int sampleStep = std::max(3, static_cast<int>(std::lround(f.h * .025)));
+  const int searchMargin = std::max(4, static_cast<int>(std::lround(f.h * .06)));
+  const int sampleLeft = x1 + sampleInset;
+  const int sampleRight = x2 - sampleInset;
+  const int searchTop = std::max(cy1, y1 - searchMargin);
+  const int searchBottom = std::min(cy2 - 1, y2 + searchMargin);
+  int refinedY1 = y1;
+  int refinedY2 = y2;
+  int longestSpan = 0;
+  for (int x = sampleLeft; x <= sampleRight; x += sampleStep) {
+    int runStart = -1;
+    for (int y = searchTop; y <= searchBottom + 1; ++y) {
+      const bool redPixel = y <= searchBottom && IsRed(Pixel(f, x, y));
+      if (redPixel) {
+        if (runStart < 0) runStart = y;
+        continue;
+      }
+      if (runStart < 0) continue;
+      const int runEnd = y - 1;
+      if (runStart <= y2 && runEnd >= y1) {
+        const int span = runEnd - runStart + 1;
+        if (span > longestSpan) {
+          longestSpan = span;
+          refinedY1 = runStart;
+          refinedY2 = runEnd;
+        }
+      }
+      runStart = -1;
+    }
+  }
+  if (longestSpan > 0) {
+    y1 = refinedY1;
+    y2 = refinedY2;
+  }
+
   red.ok = true;
   red.x1 = x1;
   red.x2 = x2;
@@ -827,60 +872,6 @@ FrameAnalysis AnalyzeFrame(const CaptureFrame& f, const std::vector<std::pair<in
   return analysis;
 }
 
-FrameAnalysis AnalyzeLockedGeometry(const CaptureFrame& f, const RedBar& lockedRedScreen, const std::vector<BarMeasure>& lockedBarsScreen) {
-  FrameAnalysis analysis;
-  if (!lockedRedScreen.ok || lockedBarsScreen.size() < 8) return analysis;
-
-  RedBar localRed = lockedRedScreen;
-  localRed.x1 = ToFrameX(f, localRed.x1);
-  localRed.x2 = ToFrameX(f, localRed.x2);
-  localRed.y1 = ToFrameY(f, localRed.y1);
-  localRed.y2 = ToFrameY(f, localRed.y2);
-  localRed.centerY = ToFrameY(f, localRed.centerY);
-  if (localRed.x2 < 0 || localRed.x1 >= f.w || localRed.centerY < 0 || localRed.centerY >= f.h) {
-    return analysis;
-  }
-
-  const int redY = std::clamp(localRed.centerY, 0, f.h - 1);
-  const int redLeft = std::max(0, localRed.x1);
-  const int redRight = std::min(f.w - 1, localRed.x2);
-  const int redStep = std::max(1, (redRight - redLeft + 1) / 48);
-  int redHits = 0;
-  int redSamples = 0;
-  for (int x = redLeft; x <= redRight; x += redStep) {
-    ++redSamples;
-    bool hit = false;
-    for (int dy = -2; dy <= 2 && !hit; ++dy) {
-      const int y = redY + dy;
-      if (y >= 0 && y < f.h) hit = IsRed(Pixel(f, x, y));
-    }
-    redHits += hit;
-  }
-  if (redSamples < 4 || redHits * 100 < redSamples * 35) return analysis;
-
-  int visibleBars = 0;
-  int whiteBars = 0;
-  for (const auto& bar : lockedBarsScreen) {
-    const int x = ToFrameX(f, (bar.x1 + bar.x2) / 2);
-    if (x < 0 || x >= f.w) continue;
-    ++visibleBars;
-    int hits = 0;
-    for (int screenY : {bar.topY1, bar.topY2, bar.bottomY1, bar.bottomY2}) {
-      const int y = ToFrameY(f, screenY);
-      if (y >= 0 && y < f.h && IsWhite(Pixel(f, x, y))) ++hits;
-    }
-    if (hits >= 2) ++whiteBars;
-  }
-  if (visibleBars > 0 && whiteBars == 0) return analysis;
-
-  analysis.ok = true;
-  analysis.inMinigame = true;
-  analysis.minigameStatus = L"in minigame";
-  analysis.red = lockedRedScreen;
-  analysis.bars = lockedBarsScreen;
-  return analysis;
-}
-
 bool IsMoving(const TrackSlot& slot) {
   if (slot.history.size() < 4) return false;
   const size_t begin = slot.history.size() > 6 ? slot.history.size() - 6 : 0;
@@ -1022,10 +1013,8 @@ void UpdatePreview(const CaptureFrame& frame,
   }
 }
 
-void WorkerLoop() {
+void WorkerLoop(const std::function<bool()>& stopRequested) {
   SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-  SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
-  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
   PostLog(L"Start: keep the game visible. Using vision to detect the red line and white bars.");
   RECT sessionClient{};
   if (!gta5::capture::GetGameClientRect(sessionClient)) {
@@ -1086,7 +1075,7 @@ void WorkerLoop() {
   double analysisIntervalSampleSum = 0.0;
   double actualAnalysisIntervalSeconds = kAnalysisIntervalSeconds;
   CaptureFrame frame;
-  while (!gta5::app::runtime::StopRequested()) {
+  while (!stopRequested()) {
     auto frameTime = AnalysisClock::now();
     if (frameTime < nextAnalysisTime) {
       std::this_thread::sleep_until(nextAnalysisTime);
@@ -1125,6 +1114,7 @@ void WorkerLoop() {
     const bool focusedCapture = hasTrackingRegion && lockedRedScreen.ok &&
                                 searchCellsScreen.ok &&
                                 searchCellsScreen.xRanges.size() == 8;
+    bool allYellowCellsCaptured = !focusedCapture;
     if (focusedCapture) {
       trackingRegion = BuildYellowCaptureRegion(lockedRedScreen, searchCellsScreen,
                                                 yellowCandidates, geometryScale,
@@ -1141,6 +1131,7 @@ void WorkerLoop() {
         lastBarsScreen.clear();
         cachedWindowGeneration = 0;
         if (CaptureScreenRegion(frame, nullptr, nullptr)) {
+          allYellowCellsCaptured = true;
           PostLog(L"cached minigame region failed; retrying full frame");
         } else {
           PostStatus(L"capture failed");
@@ -1168,22 +1159,25 @@ void WorkerLoop() {
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
       continue;
       }
+      allYellowCellsCaptured = true;
     }
     auto sampleTime = std::chrono::steady_clock::now();
 
     const bool canUseLockedGeometry = hasTrackingRegion && lockedRedScreen.ok && lastBarsScreen.size() >= 8 && searchCellsScreen.ok;
-    bool usedLockedGeometry = false;
     FrameAnalysis a;
     if (canUseLockedGeometry) {
-      a = AnalyzeLockedGeometry(frame, lockedRedScreen, lastBarsScreen);
-      usedLockedGeometry = a.inMinigame;
-    }
-    if (!usedLockedGeometry) {
+      a.ok = true;
+      a.inMinigame = true;
+      a.red = lockedRedScreen;
+      a.bars = lastBarsScreen;
+      a.minigameStatus = L"in minigame";
+    } else {
       if (focusedCapture && !CaptureScreenRegion(frame, nullptr, nullptr)) {
         PostStatus(L"capture failed");
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         continue;
       }
+      allYellowCellsCaptured = true;
       std::vector<std::pair<int, int>> knownBarXRunsLocal;
       if (knownBarXRunsScreen.size() == 8) {
         for (auto [x1, x2] : knownBarXRunsScreen) {
@@ -1195,6 +1189,20 @@ void WorkerLoop() {
     if (!a.inMinigame) {
       if (++missFrames % 15 == 1) {
         PostLog(a.minigameLog.empty() ? L"not in minigame" : a.minigameLog);
+      }
+      if (finishPendingAfter8 && missFrames >= 3 &&
+          postPress.inputJob.Succeeded()) {
+        PostLog(L"Completed: bar 8 input succeeded and minigame exited; stopping.");
+        PostStatus(L"completed; stopped");
+        gta5::app::runtime::RequestStop();
+        break;
+      }
+      const bool finalInputPending =
+          finishPendingAfter8 && postPress.inputJob.Pending();
+      if (activeFoundOnce && missFrames >= 10 && !finalInputPending) {
+        PostLog(L"Slider minigame exited; stopping session.");
+        PostStatus(L"stopped");
+        break;
       }
       if (missFrames >= 3) {
         hasTrackingRegion = false;
@@ -1243,15 +1251,11 @@ void WorkerLoop() {
       const RectI fallbackRegion =
           BuildFullYellowCaptureRegion(a.red, searchCellsScreen, geometryScale);
       if (CaptureScreenRegion(frame, &fallbackRegion, nullptr)) {
+        allYellowCellsCaptured = true;
         sampleTime = std::chrono::steady_clock::now();
-        FrameAnalysis fallbackAnalysis =
-            AnalyzeLockedGeometry(frame, lockedRedScreen, lastBarsScreen);
-        if (fallbackAnalysis.inMinigame) {
-          a = std::move(fallbackAnalysis);
-          yellow = FindActiveYellowMeasureCandidates(
-              frame, a.red, searchCellsScreen, yellowCandidates, geometryScale,
-              yellowSearchHalf, scannedYellowCells);
-        }
+        yellow = FindActiveYellowMeasureCandidates(
+            frame, a.red, searchCellsScreen, yellowCandidates, geometryScale,
+            yellowSearchHalf, scannedYellowCells);
       }
     }
     if (postPress.active && postPress.barIndex < 7) {
@@ -1262,9 +1266,51 @@ void WorkerLoop() {
           frame, a.red, searchCellsScreen, nextOnly, geometryScale, 0, nextScanned);
       if (nextYellow.ok) yellow = nextYellow;
     }
-    if (!yellow.ok && !postPress.active) {
+    if (!yellow.ok && allYellowCellsCaptured) {
       yellow = FindActiveYellowMeasure(frame, a.red, searchCellsScreen, geometryScale,
-                                       preferredYellowHalf, &scannedYellowCells);
+                                       preferredYellowHalf);
+    }
+    if (!yellow.ok && allYellowCellsCaptured) {
+      if (!CaptureScreenRegion(frame, nullptr, nullptr)) {
+        g_inGameCache = {};
+        PostStatus(L"capture failed");
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        continue;
+      }
+      sampleTime = std::chrono::steady_clock::now();
+      FrameAnalysis presence = AnalyzeFrame(frame);
+      if (!presence.inMinigame) {
+        g_inGameCache = {};
+        if (finishPendingAfter8 && postPress.inputJob.Succeeded()) {
+          PostLog(L"Completed: bar 8 input succeeded and minigame exited; stopping.");
+          PostStatus(L"completed; stopped");
+        } else {
+          PostLog(L"Slider minigame exited; stopping session.");
+          PostStatus(L"stopped");
+        }
+        break;
+      }
+
+      a = std::move(presence);
+      cachedWindowGeneration = frame.windowGeneration;
+      lockedRedScreen = a.red;
+      lastBarsScreen = a.bars;
+      geometryScale = frame.screenGeometryScale;
+      knownBarXRunsScreen.clear();
+      for (int i = 0; i < 8; ++i) {
+        knownBarXRunsScreen.push_back({a.bars[i].x1, a.bars[i].x2});
+      }
+      searchCellsScreen = BuildSearchCellsFromWhiteBars(a.bars, geometryScale);
+      cellsLocked = searchCellsScreen.ok;
+      hasTrackingRegion = a.bars.size() >= 8 && cellsLocked;
+      g_inGameCache.valid = hasTrackingRegion;
+      g_inGameCache.windowGeneration = frame.windowGeneration;
+      g_inGameCache.red = a.red;
+      g_inGameCache.bars = a.bars;
+      g_inGameCache.cells = searchCellsScreen;
+      g_inGameCache.geometryScale = geometryScale;
+      yellow = FindActiveYellowMeasure(frame, a.red, searchCellsScreen,
+                                       geometryScale, preferredYellowHalf);
     }
     int active = yellow.ok ? yellow.index : -1;
     if (active >= 0 && active != trackedActive) {
@@ -1472,7 +1518,7 @@ void WorkerLoop() {
 
   g_cursorVisible.store(false, std::memory_order_relaxed);
   g_cursorInZone.store(false, std::memory_order_relaxed);
-  if (g_marksWnd) ShowWindow(g_marksWnd, SW_HIDE);
+  if (g_marksWnd) ShowWindowAsync(g_marksWnd, SW_HIDE);
   {
     std::lock_guard<std::mutex> lock(g_previewMutex);
     const std::wstring status = g_preview.status;
@@ -1500,21 +1546,14 @@ LRESULT CALLBACK MarksProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
       }
 
-      int minX = state.bars.front().x1;
-      int maxX = state.bars.front().x2;
-      for (const auto& b : state.bars) {
-        minX = std::min(minX, b.x1);
-        maxX = std::max(maxX, b.x2);
-      }
-
       const int infoW = ScaledPx(104, state.scale);
       const int infoH = ScaledPx(62, state.scale);
       const int gap = ScaledPx(12, state.scale);
       const int pad = ScaledPx(12, state.scale);
       const int infoRight = state.red.x1 - gap;
       const int markerScreenY = state.red.centerY;
-      RECT desired{std::min(infoRight - infoW, minX) - pad, markerScreenY - infoH / 2 - pad,
-                   std::max(infoRight, maxX) + pad, markerScreenY + infoH / 2 + pad};
+      RECT desired{infoRight - infoW - pad, markerScreenY - infoH / 2 - pad,
+                   infoRight + pad, markerScreenY + infoH / 2 + pad};
       RECT clamped = ClampOverlayScreenRect(desired);
       SetWindowPos(hwnd, HWND_TOPMOST, clamped.left, clamped.top, clamped.right - clamped.left, clamped.bottom - clamped.top,
                    SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
@@ -1549,40 +1588,10 @@ LRESULT CALLBACK MarksProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
                                DEFAULT_PITCH | FF_DONTCARE, L"Consolas");
       HGDIOBJ oldFont = SelectObject(hdc, font);
-      HPEN glowPen = CreatePen(PS_SOLID, 4, kOverlayBlack);
       HPEN activePen = CreatePen(PS_SOLID, 2, kOverlayGreen);
-      HPEN donePen = CreatePen(PS_SOLID, 2, kOverlayGreen);
-      HPEN dimPen = CreatePen(PS_SOLID, 2, kOverlayDeepGreen);
-      HBRUSH activeBrush = CreateSolidBrush(kOverlayBrightGreen);
-      HBRUSH doneBrush = CreateSolidBrush(kOverlayDeepGreen);
-      HBRUSH dimBrush = CreateSolidBrush(kOverlayBlack);
       HBRUSH infoBrush = CreateSolidBrush(kOverlayBlack);
-      HGDIOBJ oldPen = SelectObject(hdc, glowPen);
+      HGDIOBJ oldPen = SelectObject(hdc, activePen);
       HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(HOLLOW_BRUSH));
-
-      const int activeBar = g_hudActiveBar.load(std::memory_order_relaxed);
-      const int markerW = ScaledPx(28, state.scale);
-      const int markerH = ScaledPx(8, state.scale);
-      const int markerLineY = state.red.centerY - wr.top;
-      for (size_t i = 0; i < state.bars.size(); ++i) {
-        const auto& b = state.bars[i];
-        const int cx = (b.x1 + b.x2) / 2 - wr.left;
-        RECT mark{cx - markerW / 2, markerLineY - markerH / 2, cx + markerW / 2, markerLineY + markerH / 2};
-        SelectObject(hdc, glowPen);
-        SelectObject(hdc, GetStockObject(HOLLOW_BRUSH));
-        RoundRect(hdc, mark.left - 2, mark.top - 2, mark.right + 2, mark.bottom + 2, markerH + 4, markerH + 4);
-        if (activeBar == static_cast<int>(i) + 1) {
-          SelectObject(hdc, activePen);
-          SelectObject(hdc, activeBrush);
-        } else if (activeBar > static_cast<int>(i) + 1) {
-          SelectObject(hdc, donePen);
-          SelectObject(hdc, doneBrush);
-        } else {
-          SelectObject(hdc, dimPen);
-          SelectObject(hdc, dimBrush);
-        }
-        RoundRect(hdc, mark.left, mark.top, mark.right, mark.bottom, markerH, markerH);
-      }
 
       const int infoW = ScaledPx(104, state.scale);
       const int infoH = ScaledPx(62, state.scale);
@@ -1615,13 +1624,7 @@ LRESULT CALLBACK MarksProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
       SelectObject(hdc, oldPen);
       SelectObject(hdc, oldFont);
       DeleteObject(font);
-      DeleteObject(glowPen);
       DeleteObject(activePen);
-      DeleteObject(donePen);
-      DeleteObject(dimPen);
-      DeleteObject(activeBrush);
-      DeleteObject(doneBrush);
-      DeleteObject(dimBrush);
       DeleteObject(infoBrush);
       EndPaint(hwnd, &ps);
       return 0;
@@ -1759,8 +1762,10 @@ void ClearOverlayState() {
     g_preview.lastLog = lastLog;
     g_preview.running = gta5::app::runtime::Running();
   }
-  if (g_cursorWnd) ShowWindow(g_cursorWnd, SW_HIDE);
-  if (g_marksWnd) ShowWindow(g_marksWnd, SW_HIDE);
+  // This may run on the session worker while the UI thread is joining it.
+  // Synchronous cross-thread ShowWindow calls can deadlock that shutdown path.
+  if (g_cursorWnd) ShowWindowAsync(g_cursorWnd, SW_HIDE);
+  if (g_marksWnd) ShowWindowAsync(g_marksWnd, SW_HIDE);
   RequestMarksRepaint();
 }
 void HideTransientOverlays() { ClearOverlayState(); }
@@ -1784,7 +1789,11 @@ bool DetectInGame() {
   return true;
 }
 void ResetInGameCache() { g_inGameCache = {}; }
-void RunSession() { WorkerLoop(); ClearOverlayState(); ResetInGameCache(); }
+void RunSession(const std::function<bool()>& stopRequested) {
+  WorkerLoop(stopRequested);
+  ClearOverlayState();
+  ResetInGameCache();
+}
 int CursorSize() { return kCursorSize; }
 LRESULT CALLBACK CursorWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) { return CursorProc(hwnd, msg, wParam, lParam); }
 LRESULT CALLBACK MarksWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) { return MarksProc(hwnd, msg, wParam, lParam); }

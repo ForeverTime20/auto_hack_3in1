@@ -9,9 +9,12 @@
 #include <cmath>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <numeric>
 #include <optional>
+#include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace gta5::games::match {
@@ -42,15 +45,204 @@ struct Geometry {
 struct Rgb { int r = 0, g = 0, b = 0; };
 struct VisualState {
   int leftCurrent = -1;
+  int rightCurrent = -1;
   int completedMask = 0;
   int usedMask = 0;
   bool operator==(const VisualState& other) const {
-    return leftCurrent == other.leftCurrent && completedMask == other.completedMask &&
-           usedMask == other.usedMask;
+    return leftCurrent == other.leftCurrent && rightCurrent == other.rightCurrent &&
+           completedMask == other.completedMask && usedMask == other.usedMask;
   }
 };
 
+enum class InputPhase { None, EnteringRight, ConfirmingChoice };
+
 std::optional<Geometry> g_detectedGeometry;
+
+struct OverlayText {
+  int screenX = 0;
+  int screenCenterY = 0;
+  int fontHeight = 0;
+  RECT screenBounds{};
+  std::wstring text;
+};
+
+struct OverlaySnapshot {
+  bool visible = false;
+  std::array<OverlayText, 3> multipliers{};
+  OverlayText equation;
+};
+
+HWND g_overlayWindow = nullptr;
+std::mutex g_overlayMutex;
+OverlaySnapshot g_overlaySnapshot;
+
+void ClearOverlayState() {
+  {
+    std::lock_guard<std::mutex> lock(g_overlayMutex);
+    g_overlaySnapshot = {};
+  }
+  if (g_overlayWindow) InvalidateRect(g_overlayWindow, nullptr, FALSE);
+}
+
+int AnalysisToScreenX(const Frame& frame, int x) {
+  return frame.screenX + static_cast<int>(std::lround(x * frame.toScreenX));
+}
+
+int AnalysisToScreenY(const Frame& frame, int y) {
+  return frame.screenY + static_cast<int>(std::lround(y * frame.toScreenY));
+}
+
+void PublishOverlay(const Frame& frame, const Geometry& geometry,
+                    const std::array<int, 3>& values,
+                    const std::array<int, 3>& multipliers,
+                    const std::array<int, 3>& solution, int target) {
+  OverlaySnapshot next;
+  next.visible = true;
+  const int targetScreenHeight = std::max(
+      1, AnalysisToScreenY(frame, geometry.targetDigits[0].bottom) -
+             AnalysisToScreenY(frame, geometry.targetDigits[0].top));
+  const int labelFont = std::clamp(
+      static_cast<int>(std::lround(targetScreenHeight * .27)), 15, 44);
+  const int equationFont = std::clamp(
+      static_cast<int>(std::lround(targetScreenHeight * .25)), 15, 40);
+  const int labelGap = std::max(8, static_cast<int>(std::lround(frame.screenH * .012)));
+  const int equationGap = std::max(10, static_cast<int>(std::lround(frame.screenH * .022)));
+  const RECT screenBounds{frame.screenX, frame.screenY,
+                          frame.screenX + frame.screenW,
+                          frame.screenY + frame.screenH};
+
+  for (int row = 0; row < 3; ++row) {
+    const RectI& icon = geometry.multiplierIcons[row];
+    const int radius = static_cast<int>(std::lround(icon.width() / (2 * .78)));
+    next.multipliers[row] = {
+        AnalysisToScreenX(frame, icon.centerX() + radius) + labelGap,
+        AnalysisToScreenY(frame, icon.centerY()), labelFont, screenBounds,
+        L"x" + std::to_wstring(multipliers[row])};
+  }
+
+  std::wstring equation;
+  for (int row = 0; row < 3; ++row) {
+    if (row) equation += L" + ";
+    equation += std::to_wstring(values[row]);
+    equation += L"x";
+    equation += std::to_wstring(multipliers[solution[row]]);
+  }
+  equation += L" = ";
+  equation += std::to_wstring(target);
+  const RectI& lastTarget = geometry.targetDigits[2];
+  next.equation = {
+      AnalysisToScreenX(frame, lastTarget.right) + equationGap,
+      AnalysisToScreenY(frame, (lastTarget.top + lastTarget.bottom) / 2),
+      equationFont, screenBounds, std::move(equation)};
+
+  {
+    std::lock_guard<std::mutex> lock(g_overlayMutex);
+    g_overlaySnapshot = std::move(next);
+  }
+  if (g_overlayWindow) InvalidateRect(g_overlayWindow, nullptr, FALSE);
+}
+
+void SyncOverlayWindow(bool enabled) {
+  if (!g_overlayWindow) return;
+  bool visible = false;
+  {
+    std::lock_guard<std::mutex> lock(g_overlayMutex);
+    visible = g_overlaySnapshot.visible;
+  }
+  if (!enabled || !visible) {
+    ShowWindow(g_overlayWindow, SW_HIDE);
+    return;
+  }
+  const int x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+  const int y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+  const int width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+  const int height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+  SetWindowPos(g_overlayWindow, HWND_TOPMOST, x, y, width, height,
+               SWP_NOACTIVATE | SWP_SHOWWINDOW);
+}
+
+void DrawOverlay(HDC dc, HWND hwnd) {
+  RECT client{};
+  GetClientRect(hwnd, &client);
+  FillRect(dc, &client, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+
+  OverlaySnapshot snapshot;
+  {
+    std::lock_guard<std::mutex> lock(g_overlayMutex);
+    snapshot = g_overlaySnapshot;
+  }
+  if (!snapshot.visible) return;
+
+  const int virtualX = GetSystemMetrics(SM_XVIRTUALSCREEN);
+  const int virtualY = GetSystemMetrics(SM_YVIRTUALSCREEN);
+  SetBkMode(dc, TRANSPARENT);
+
+  auto drawTag = [&](const OverlayText& item, bool equation) {
+    const int fontHeight = std::max(12, item.fontHeight);
+    HFONT font = CreateFontW(-fontHeight, 0, 0, 0, equation ? FW_SEMIBOLD : FW_BOLD,
+                             FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                             OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+                             L"Segoe UI");
+    HGDIOBJ oldFont = SelectObject(dc, font);
+    RECT measured{0, 0, 0, 0};
+    DrawTextW(dc, item.text.c_str(), -1, &measured,
+              DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+    const int padX = std::max(7, fontHeight / 2);
+    const int padY = std::max(4, fontHeight / 4);
+    RECT box{item.screenX - virtualX,
+             item.screenCenterY - virtualY - (measured.bottom + padY * 2) / 2,
+             0, 0};
+    box.right = box.left + measured.right + padX * 2;
+    box.bottom = box.top + measured.bottom + padY * 2;
+
+    // Keep tags inside the captured GTA client. Normally they remain to the
+    // right of their anchors; only constrained/windowed layouts shift them.
+    const int safeMargin = std::max(4, fontHeight / 4);
+    const int minLeft = item.screenBounds.left - virtualX + safeMargin;
+    const int maxRight = item.screenBounds.right - virtualX - safeMargin;
+    const int minTop = item.screenBounds.top - virtualY + safeMargin;
+    const int maxBottom = item.screenBounds.bottom - virtualY - safeMargin;
+    if (box.right > maxRight) OffsetRect(&box, maxRight - box.right, 0);
+    if (box.left < minLeft) OffsetRect(&box, minLeft - box.left, 0);
+    if (box.bottom > maxBottom) OffsetRect(&box, 0, maxBottom - box.bottom);
+    if (box.top < minTop) OffsetRect(&box, 0, minTop - box.top);
+
+    HBRUSH background = CreateSolidBrush(equation ? RGB(12, 17, 23) : RGB(8, 22, 22));
+    HPEN glow = CreatePen(PS_SOLID, std::max(3, fontHeight / 5),
+                          equation ? RGB(63, 18, 30) : RGB(0, 55, 52));
+    HPEN border = CreatePen(PS_SOLID, std::max(1, fontHeight / 14),
+                            equation ? RGB(255, 74, 102) : RGB(58, 238, 207));
+    HGDIOBJ oldBrush = SelectObject(dc, background);
+    HGDIOBJ oldPen = SelectObject(dc, glow);
+    const int radius = std::clamp(fontHeight / 3, 4, 8);
+    RoundRect(dc, box.left, box.top, box.right, box.bottom, radius, radius);
+    SelectObject(dc, border);
+    RoundRect(dc, box.left, box.top, box.right, box.bottom, radius, radius);
+
+    RECT textRect{box.left + padX, box.top + padY,
+                  box.right - padX, box.bottom - padY};
+    RECT shadow = textRect;
+    OffsetRect(&shadow, std::max(1, fontHeight / 12), std::max(1, fontHeight / 12));
+    SetTextColor(dc, equation ? RGB(90, 18, 31) : RGB(0, 78, 72));
+    DrawTextW(dc, item.text.c_str(), -1, &shadow,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    SetTextColor(dc, equation ? RGB(255, 238, 241) : RGB(116, 255, 226));
+    DrawTextW(dc, item.text.c_str(), -1, &textRect,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+    SelectObject(dc, oldPen);
+    SelectObject(dc, oldBrush);
+    SelectObject(dc, oldFont);
+    DeleteObject(background);
+    DeleteObject(glow);
+    DeleteObject(border);
+    DeleteObject(font);
+  };
+
+  for (const OverlayText& item : snapshot.multipliers) drawTag(item, false);
+  drawTag(snapshot.equation, true);
+}
 
 std::uint32_t Pixel(const Frame& frame, int x, int y) {
   if (x < 0 || y < 0 || x >= frame.width || y >= frame.height) return 0;
@@ -190,6 +382,24 @@ std::optional<Geometry> LocateGeometry(const Frame& frame) {
 
   const int frameH = bottom - top;
   const int frameW = static_cast<int>(std::lround((edges[3] - edges[0]) / 3.0));
+  constexpr double kTargetCellAspect = 89.0 / 116.0;
+  const double targetCellAspect = frameW / static_cast<double>(frameH);
+  if (targetCellAspect < kTargetCellAspect * .90 ||
+      targetCellAspect > kTargetCellAspect * 1.10) return std::nullopt;
+  const int connectionInset = std::max(delta, static_cast<int>(std::lround(frameH * .06)));
+  const int connectionSpan = std::max(connectionInset + 1, frameH / 3);
+  auto verticalSegmentContrast = [&](int x, int y1, int y2) {
+    return MeanNeutralVertical(frame, x, y1, y2) -
+        (MeanNeutralVertical(frame, x - delta, y1, y2) +
+         MeanNeutralVertical(frame, x + delta, y1, y2)) * .5;
+  };
+  for (int edge : edges) {
+    const double upper = verticalSegmentContrast(
+        edge, top + connectionInset, top + connectionSpan);
+    const double lower = verticalSegmentContrast(
+        edge, bottom - connectionSpan, bottom - connectionInset);
+    if (upper < 15 || lower < 15) return std::nullopt;
+  }
   const int edgeOffset = std::max(3, static_cast<int>(std::lround(frameH * .05)));
   auto maximum = [&](int x, int y) { const Rgb c = Color(Pixel(frame, x, y)); return std::max({c.r,c.g,c.b}); };
   auto verticalLine = [&](int x, int y, int height) {
@@ -383,6 +593,7 @@ int UniqueColoredRow(const std::array<double, 3>& scores) {
 
 VisualState ReadVisualState(const Frame& frame, const Geometry& geometry) {
   std::array<double, 3> leftScores{};
+  std::array<double, 3> rightScores{};
   VisualState state;
   const int block = std::max(1, static_cast<int>(std::lround(geometry.scale * 4)));
   const int wireBlock = std::max(1, static_cast<int>(std::lround(geometry.scale * 2)));
@@ -399,6 +610,13 @@ VisualState ReadVisualState(const Frame& frame, const Geometry& geometry) {
     const RectI& icon = geometry.multiplierIcons[row];
     const int circleRadius = static_cast<int>(std::lround(icon.width() / (2 * .78)));
     const int circleLeft = icon.centerX() - circleRadius;
+    const int circleMargin = std::max(2, static_cast<int>(std::lround(circleRadius * .08)));
+    rightScores[row] = MosaicChromaScore(
+        frame,
+        {icon.centerX() - circleRadius - circleMargin,
+         icon.centerY() - circleRadius - circleMargin,
+         icon.centerX() + circleRadius + circleMargin,
+         icon.centerY() + circleRadius + circleMargin}, block);
     const double rightWire = MosaicChromaScore(frame,
         {circleLeft - static_cast<int>(std::lround(h * .69)), icon.centerY()-halfWire,
          circleLeft - static_cast<int>(std::lround(h * .34)), icon.centerY()+halfWire}, wireBlock);
@@ -406,6 +624,7 @@ VisualState ReadVisualState(const Frame& frame, const Geometry& geometry) {
     if (rightWire > .18) state.usedMask |= 1 << row;
   }
   state.leftCurrent = UniqueColoredRow(leftScores);
+  state.rightCurrent = UniqueColoredRow(rightScores);
   return state;
 }
 
@@ -465,38 +684,58 @@ void WaitFrame(const std::function<bool()>& stopRequested, Clock::time_point sta
 
 bool DetectInGame() {
   Frame frame;
-  if (!gta5::capture::CaptureGameFrame(frame)) { g_detectedGeometry.reset(); return false; }
+  if (!gta5::capture::CaptureGameFrame(frame)) {
+    g_detectedGeometry.reset();
+    ClearOverlayState();
+    return false;
+  }
   g_detectedGeometry = LocateGeometry(frame);
+  if (!g_detectedGeometry) ClearOverlayState();
   return g_detectedGeometry.has_value();
 }
 
-void ResetInGameCache() { g_detectedGeometry.reset(); }
+void ResetInGameCache() {
+  g_detectedGeometry.reset();
+  ClearOverlayState();
+}
 
 bool RunSession(const std::function<bool()>& stopRequested,
+                const std::function<bool()>& overlayEnabled,
                 const std::function<void(const std::wstring&)>& status) {
   std::optional<Geometry> geometry = g_detectedGeometry;
   std::optional<std::array<int, 3>> solution;
   gta5::input::Job inputJob;
+  InputPhase inputPhase = InputPhase::None;
   VisualState state{}, previous{};
   int absentFrames = 0, stableFrames = 0;
-  bool havePrevious = false, awaitingTransition = false, stateReady = false;
+  bool havePrevious = false, awaitingRightSelection = false;
+  bool awaitingTransition = false, stateReady = false;
   int oldCompleted = 0, oldUsed = 0, connectingLeft = -1, connectingRight = -1;
+  int enterAttempts = 0, rightStableFrames = 0, previousRight = -1;
+  auto rightSelectionDeadline = Clock::time_point{};
   auto transitionDeadline = Clock::time_point{};
   std::wstring lastStatus;
   auto setStatus = [&](const wchar_t* value) {
     if (lastStatus != value) { lastStatus = value; status(value); }
   };
   auto resetPlan = [&] {
-    solution.reset(); awaitingTransition = false; stateReady = false;
+    solution.reset(); inputPhase = InputPhase::None;
+    awaitingRightSelection = false; awaitingTransition = false; stateReady = false;
+    enterAttempts = 0; rightStableFrames = 0; previousRight = -1;
     stableFrames = 0; havePrevious = false;
+    ClearOverlayState();
   };
   auto cleanup = [&] {
-    gta5::input::CancelAll(); inputJob = {}; geometry.reset(); ResetInGameCache();
+    gta5::input::CancelAll(); inputJob = {}; geometry.reset();
+    ClearOverlay();
+    ResetInGameCache();
   };
 
+  ClearOverlayState();
   setStatus(L"match: locating");
   while (!stopRequested()) {
     const auto started = Clock::now();
+    SyncOverlayWindow(overlayEnabled());
     Frame frame;
     if (!gta5::capture::CaptureGameFrame(frame)) {
       geometry.reset(); g_detectedGeometry.reset(); resetPlan();
@@ -510,7 +749,8 @@ bool RunSession(const std::function<bool()>& stopRequested,
       if (!relocated) {
         geometry.reset(); g_detectedGeometry.reset();
         if (++absentFrames >= 3) {
-          if (inputJob && BitCount3(oldCompleted) == 2) {
+          if (inputJob && inputPhase == InputPhase::ConfirmingChoice &&
+              BitCount3(oldCompleted) == 2) {
             if (inputJob.Pending()) { WaitFrame(stopRequested, started); continue; }
             if (inputJob.Succeeded()) {
               setStatus(L"match: completed"); cleanup(); return true;
@@ -537,13 +777,70 @@ bool RunSession(const std::function<bool()>& stopRequested,
         WaitFrame(stopRequested, started); continue;
       }
       inputJob = {};
-      awaitingTransition = true;
-      transitionDeadline = Clock::now() + std::chrono::seconds(6);
-      stableFrames = 0; havePrevious = false;
-      setStatus(L"match: verifying connection");
+      if (inputPhase == InputPhase::EnteringRight) {
+        inputPhase = InputPhase::None;
+        awaitingRightSelection = true;
+        rightSelectionDeadline = Clock::now() + std::chrono::milliseconds(1200);
+        rightStableFrames = 0;
+        previousRight = -1;
+      } else if (inputPhase == InputPhase::ConfirmingChoice) {
+        inputPhase = InputPhase::None;
+        awaitingTransition = true;
+        transitionDeadline = Clock::now() + std::chrono::seconds(6);
+        stableFrames = 0; havePrevious = false;
+        setStatus(L"match: verifying connection");
+      } else {
+        resetPlan();
+      }
     }
 
     state = ReadVisualState(frame, *geometry);
+    if (awaitingRightSelection) {
+      if (state.rightCurrent >= 0 && state.rightCurrent == previousRight) ++rightStableFrames;
+      else rightStableFrames = state.rightCurrent >= 0 ? 1 : 0;
+      previousRight = state.rightCurrent;
+
+      if (rightStableFrames >= 2) {
+        int selectedRight = (oldUsed & (1 << connectingLeft))
+            ? NextAvailableRow(connectingLeft, oldUsed) : connectingLeft;
+        std::vector<gta5::input::Key> keys;
+        for (int moves = 0; selectedRight != connectingRight && moves < 3; ++moves) {
+          keys.push_back(gta5::input::Key::FromVirtualKey(VK_DOWN));
+          selectedRight = NextAvailableRow(selectedRight, oldUsed);
+        }
+        if (selectedRight != connectingRight) {
+          resetPlan(); setStatus(L"match: analyzing");
+          WaitFrame(stopRequested, started); continue;
+        }
+        keys.push_back(gta5::input::Key::FromVirtualKey(VK_RETURN));
+        const HWND foreground = ForegroundGameWindow(frame);
+        if (!foreground) { WaitFrame(stopRequested, started); continue; }
+        awaitingRightSelection = false;
+        inputPhase = InputPhase::ConfirmingChoice;
+        inputJob = gta5::input::QueueSequence(keys, foreground);
+        WaitFrame(stopRequested, started); continue;
+      }
+
+      if (Clock::now() >= rightSelectionDeadline) {
+        if (state.leftCurrent == connectingLeft && enterAttempts < 3) {
+          const HWND foreground = ForegroundGameWindow(frame);
+          if (!foreground) { WaitFrame(stopRequested, started); continue; }
+          awaitingRightSelection = false;
+          ++enterAttempts;
+          inputPhase = InputPhase::EnteringRight;
+          inputJob = gta5::input::QueueSequence(
+              std::vector<gta5::input::Key>{
+                  gta5::input::Key::FromVirtualKey(VK_RETURN)}, foreground);
+        } else {
+          // Never send navigation until a visible right-side cursor proves
+          // that GTA accepted the first Enter.
+          cleanup();
+          return false;
+        }
+      }
+      WaitFrame(stopRequested, started); continue;
+    }
+
     if (awaitingTransition) {
       const bool finalPair = BitCount3(oldCompleted) == 2;
       const bool connected = (state.completedMask & (1 << connectingLeft)) &&
@@ -577,6 +874,8 @@ bool RunSession(const std::function<bool()>& stopRequested,
       if (!solution) {
         setStatus(L"match: no solution"); cleanup(); return false;
       }
+      PublishOverlay(frame, *geometry, values, multipliers, *solution, target);
+      SyncOverlayWindow(overlayEnabled());
       setStatus(L"match: connecting");
     }
 
@@ -598,20 +897,18 @@ bool RunSession(const std::function<bool()>& stopRequested,
       WaitFrame(stopRequested, started); continue;
     }
     const int targetRight = (*solution)[leftRow];
-    int selectedRight = (state.usedMask & (1 << leftRow))
-        ? NextAvailableRow(leftRow, state.usedMask) : leftRow;
-    std::vector<gta5::input::Key> keys{gta5::input::Key::FromVirtualKey(VK_RETURN)};
-    for (int moves = 0; selectedRight != targetRight && moves < 3; ++moves) {
-      keys.push_back(gta5::input::Key::FromVirtualKey(VK_DOWN));
-      selectedRight = NextAvailableRow(selectedRight, state.usedMask);
-    }
-    if (selectedRight != targetRight) { resetPlan(); WaitFrame(stopRequested, started); continue; }
-    keys.push_back(gta5::input::Key::FromVirtualKey(VK_RETURN));
     const HWND foreground = ForegroundGameWindow(frame);
     if (!foreground) { WaitFrame(stopRequested, started); continue; }
     oldCompleted = state.completedMask; oldUsed = state.usedMask;
     connectingLeft = leftRow; connectingRight = targetRight;
-    inputJob = gta5::input::QueueSequence(keys, foreground);
+    enterAttempts = 1;
+    inputPhase = InputPhase::EnteringRight;
+    // Entering the right selector and navigating it are separate verified
+    // phases. Otherwise a dropped Enter turns the following Down into a
+    // left-side move and desynchronizes the solver.
+    inputJob = gta5::input::QueueSequence(
+        std::vector<gta5::input::Key>{gta5::input::Key::FromVirtualKey(VK_RETURN)},
+        foreground);
     stateReady = false;
     setStatus(L"match: connecting");
     WaitFrame(stopRequested, started);
@@ -619,6 +916,31 @@ bool RunSession(const std::function<bool()>& stopRequested,
 
   cleanup();
   return false;
+}
+
+void SetOverlayWindow(HWND hwnd) { g_overlayWindow = hwnd; }
+
+void ClearOverlay() {
+  ClearOverlayState();
+  if (g_overlayWindow) ShowWindow(g_overlayWindow, SW_HIDE);
+}
+
+LRESULT CALLBACK OverlayWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+  switch (msg) {
+    case WM_ERASEBKGND:
+      return 1;
+    case WM_NCHITTEST:
+      return HTTRANSPARENT;
+    case WM_PAINT: {
+      PAINTSTRUCT paint{};
+      HDC dc = BeginPaint(hwnd, &paint);
+      DrawOverlay(dc, hwnd);
+      EndPaint(hwnd, &paint);
+      return 0;
+    }
+    default:
+      return DefWindowProcW(hwnd, msg, wp, lp);
+  }
 }
 
 }  // namespace gta5::games::match
