@@ -956,13 +956,11 @@ bool RunSession(const std::function<bool()>& stopRequested,
     std::uint64_t storedGeneration = gDetectedGeneration;
     std::optional<std::uint64_t> handledHash;
     bool completedAnyRound = false;
-    bool inputCompleted = false;
     bool waitingForNextRound = false;
     bool verificationPending = false;
     gta5::input::Job inputJob;
     std::uint64_t inputTargetHash = 0;
     int correctionAttempt = 0;
-    int absentFrames = 0;
     auto verificationDue = Clock::time_point{};
     auto nextRoundDeadline = Clock::time_point{};
     std::string lastError;
@@ -997,7 +995,6 @@ bool RunSession(const std::function<bool()>& stopRequested,
                 storedGeneration = 0;
                 gDetectedGeometry.reset();
                 gDetectedGeneration = 0;
-                absentFrames = 0;
             }
 
             if (!storedGeometry) {
@@ -1014,45 +1011,48 @@ bool RunSession(const std::function<bool()>& stopRequested,
                 setStatus(L"sort_fingerprint: analyzing");
                 log(L"sort_fingerprint: detected first round; cached ROI geometry");
             } else if (!anchorsPresent(screen, storedGeometry->anchors)) {
-                const auto headers = findHeaderBars(screen);
-                const auto relocatedAnchors = selectAnchors(headers, screen.w, screen.h);
-                if (relocatedAnchors && anchorsPresent(screen, *relocatedAnchors) &&
-                    isSortFingerprintAnchorLayout(*relocatedAnchors, screen.h)) {
-                    RoiResult relocated = analyzeRoi(screen, *relocatedAnchors, false);
-                    storedGeometry = RoiGeometry{relocated.anchors, relocated.frames};
-                    storedGeneration = screen.windowGeneration;
-                    absentFrames = 0;
-                    PublishOverlay(screen, relocated, false);
-                    log(L"sort_fingerprint: cached anchors failed; relocated in full frame");
-                } else {
-                ++absentFrames;
-                if (absentFrames < 2) {
+                if (!waitingForNextRound) {
+                    const auto headers = findHeaderBars(screen);
+                    const auto relocatedAnchors = selectAnchors(headers, screen.w, screen.h);
+                    if (relocatedAnchors && anchorsPresent(screen, *relocatedAnchors) &&
+                        isSortFingerprintAnchorLayout(*relocatedAnchors, screen.h)) {
+                        RoiResult relocated = analyzeRoi(screen, *relocatedAnchors, false);
+                        storedGeometry = RoiGeometry{relocated.anchors, relocated.frames};
+                        storedGeneration = screen.windowGeneration;
+                        PublishOverlay(screen, relocated, false);
+                        log(L"sort_fingerprint: cached anchors failed; relocated in full frame");
+                    } else {
+                        verificationPending = false;
+                        ClearOverlayState();
+                        waitingForNextRound = true;
+                        nextRoundDeadline = now + std::chrono::seconds(5);
+                        setStatus(L"sort_fingerprint: waiting next round");
+                        log(L"sort_fingerprint: minigame left; waiting up to 5 seconds for next round");
+                    }
+                }
+
+                if (waitingForNextRound) {
+                    if (inputJob && !inputJob.Pending()) {
+                        if (inputJob.Succeeded()) {
+                            handledHash = inputTargetHash;
+                            completedAnyRound = true;
+                        } else {
+                            handledHash.reset();
+                            correctionAttempt = 0;
+                            log(L"sort_fingerprint: foreground changed or input failed while waiting");
+                        }
+                        inputJob = {};
+                    }
+                    if (now >= nextRoundDeadline) {
+                        log(L"sort_fingerprint: no next round within 5 seconds; completed");
+                        break;
+                    }
                     waitForNextFrame(frameStarted);
                     continue;
                 }
-                verificationPending = false;
-                if (!inputCompleted) {
-                    log(L"sort_fingerprint: minigame exited before input completed");
-                    break;
-                }
-                if (!waitingForNextRound) {
-                    ClearOverlayState();
-                    waitingForNextRound = true;
-                    nextRoundDeadline = now + std::chrono::seconds(5);
-                    setStatus(L"sort_fingerprint: waiting next round");
-                    log(L"sort_fingerprint: round left after input; waiting up to 5 seconds for next round");
-                } else if (now >= nextRoundDeadline) {
-                    log(L"sort_fingerprint: no next round within 5 seconds; completed");
-                    break;
-                }
-                waitForNextFrame(frameStarted);
-                continue;
-                }
             } else {
-                absentFrames = 0;
                 if (waitingForNextRound) {
                     waitingForNextRound = false;
-                    inputCompleted = false;
                     verificationPending = false;
                     correctionAttempt = 0;
                     handledHash.reset();
@@ -1068,14 +1068,12 @@ bool RunSession(const std::function<bool()>& stopRequested,
                 }
                 if (inputJob.Succeeded()) {
                     handledHash = inputTargetHash;
-                    inputCompleted = true;
                     completedAnyRound = true;
                     verificationPending = true;
                     verificationDue = Clock::now() + std::chrono::milliseconds(kVerificationDelayMs);
                     setStatus(L"sort_fingerprint: verifying input");
                 } else {
                     handledHash.reset();
-                    inputCompleted = false;
                     verificationPending = false;
                     correctionAttempt = 0;
                     log(L"sort_fingerprint: foreground changed or input failed; retrying analysis");
@@ -1102,7 +1100,6 @@ bool RunSession(const std::function<bool()>& stopRequested,
                 isVerification = true;
                 ++correctionAttempt;
             } else if (handledHash) {
-                inputCompleted = false;
                 verificationPending = false;
                 correctionAttempt = 0;
                 handledHash.reset();
@@ -1119,7 +1116,6 @@ bool RunSession(const std::function<bool()>& stopRequested,
 
             if (plan.keys.empty()) {
                 handledHash = result.targetHash;
-                inputCompleted = true;
                 completedAnyRound = true;
                 verificationPending = false;
                 setStatus(L"sort_fingerprint: round complete");
