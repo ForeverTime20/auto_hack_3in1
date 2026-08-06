@@ -40,6 +40,7 @@ struct Frame {
     int x = 0, y = 0, w = 0, h = 0;
     int screenW = 0, screenH = 0;
     double toScreenX = 1.0, toScreenY = 1.0;
+    std::uint64_t windowGeneration = 0;
     std::vector<uint8_t> bgra;
     std::vector<uint8_t> gray;
 };
@@ -54,6 +55,18 @@ struct RoiInfo {
     Rect panel;
     TitleBars bars;
 };
+
+struct InGameGeometry {
+    bool valid = false;
+    std::uint64_t windowGeneration = 0;
+    int frameW = 0;
+    int frameH = 0;
+    RoiInfo roi;
+    Rect target;
+    std::vector<Rect> components;
+};
+
+static InGameGeometry gDetectedGeometry;
 
 struct BlockInfo {
     int index = 0;
@@ -385,6 +398,7 @@ static bool captureScreen(Frame& out) {
     out.screenW = captured.screenW; out.screenH = captured.screenH;
     out.toScreenX = captured.toScreenX;
     out.toScreenY = captured.toScreenY;
+    out.windowGeneration = captured.windowGeneration;
     const uint8_t* px = reinterpret_cast<const uint8_t*>(captured.bgra.data());
     out.bgra.assign(px, px + static_cast<size_t>(out.w) * out.h * 4);
     out.gray.resize(static_cast<size_t>(out.w) * out.h);
@@ -600,6 +614,31 @@ static RoiInfo detectMinigame(const Frame& f, std::string* diag = nullptr) {
         *diag = buf;
     }
     return info;
+}
+
+static bool validateMinigameGeometry(const Frame& f, const InGameGeometry& geometry) {
+    if (!geometry.valid || geometry.windowGeneration != f.windowGeneration ||
+        geometry.frameW != f.w || geometry.frameH != f.h) return false;
+
+    auto hasWhiteUi = [&](Rect rect) {
+        rect = clampRect(rect, f.w, f.h);
+        if (rect.w <= 0 || rect.h <= 0) return false;
+        const int step = std::max(1, std::min(rect.w, rect.h) / 12);
+        int white = 0;
+        int samples = 0;
+        for (int y = rect.y; y < rect.y + rect.h; y += step) {
+            for (int x = rect.x; x < rect.x + rect.w; x += step) {
+                const size_t pixel = (static_cast<size_t>(y) * f.w + x) * 4;
+                white += isFlashingStyleWhite(f.bgra[pixel + 2], f.bgra[pixel + 1], f.bgra[pixel]) ? 1 : 0;
+                ++samples;
+            }
+        }
+        return samples > 0 && white * 100 >= samples * 2;
+    };
+
+    return hasWhiteUi(geometry.roi.bars.target) &&
+           hasWhiteUi(geometry.roi.bars.components) &&
+           hasWhiteUi(geometry.roi.bars.signals);
 }
 
 static std::vector<int> edgeLinePeaks(const std::vector<int>& projection, int base, int minDist, double thresholdRatio) {
@@ -1238,17 +1277,20 @@ static void planAndRunAutomation(const OverlayState& state, AutomationState& aut
     }
 }
 
-static OverlayState analyzeFrame(const Frame& f, SolverCache& cache, std::string* diag = nullptr, FrameTiming* timing = nullptr) {
+static OverlayState analyzeFrame(const Frame& f, SolverCache& cache, std::string* diag = nullptr,
+                                 FrameTiming* timing = nullptr, InGameGeometry* geometry = nullptr) {
     auto analyzeStart = Clock::now();
     OverlayState os;
     std::string minigameDiag;
     auto phaseStart = Clock::now();
-    RoiInfo roi = detectMinigame(f, &minigameDiag);
+    const bool geometryHit = geometry && validateMinigameGeometry(f, *geometry);
+    RoiInfo roi = geometryHit ? geometry->roi : detectMinigame(f, &minigameDiag);
     if (timing) {
         timing->gateMs = msSince(phaseStart);
         timing->minigame = roi.isMinigame;
     }
     if (!roi.isMinigame) {
+        if (geometry) *geometry = {};
         if (diag) *diag = "not in minigame: " + minigameDiag;
         if (timing) timing->analyzeMs = msSince(analyzeStart);
         return os;
@@ -1268,17 +1310,26 @@ static OverlayState analyzeFrame(const Frame& f, SolverCache& cache, std::string
     }
     if (timing) timing->successMs = msSince(phaseStart);
 
-    Rect target;
-    std::vector<Rect> comps;
+    Rect target = geometryHit ? geometry->target : Rect{};
+    std::vector<Rect> comps = geometryHit ? geometry->components : std::vector<Rect>{};
     std::string roiDiag;
     phaseStart = Clock::now();
-    if (!detectRois(f, roi, target, comps, &roiDiag)) {
+    if (!geometryHit && !detectRois(f, roi, target, comps, &roiDiag)) {
         if (diag) *diag = "minigame found, ROI failed: " + roiDiag;
         if (timing) {
             timing->roiMs = msSince(phaseStart);
             timing->analyzeMs = msSince(analyzeStart);
         }
         return os;
+    }
+    if (geometry && !geometryHit) {
+        geometry->valid = true;
+        geometry->windowGeneration = f.windowGeneration;
+        geometry->frameW = f.w;
+        geometry->frameH = f.h;
+        geometry->roi = roi;
+        geometry->target = target;
+        geometry->components = comps;
     }
     if (timing) timing->roiMs = msSince(phaseStart);
 
@@ -1743,7 +1794,30 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 
-bool DetectInGame() { Frame f; if (!captureScreen(f)) return false; std::string diag; return detectMinigame(f, &diag).isMinigame; }
+bool DetectInGame() {
+  Frame f;
+  if (!captureScreen(f)) {
+    gDetectedGeometry = {};
+    return false;
+  }
+  std::string diag;
+  RoiInfo roi = detectMinigame(f, &diag);
+  Rect target;
+  std::vector<Rect> components;
+  if (!roi.isMinigame || !detectRois(f, roi, target, components, &diag)) {
+    gDetectedGeometry = {};
+    return false;
+  }
+  gDetectedGeometry.valid = true;
+  gDetectedGeometry.windowGeneration = f.windowGeneration;
+  gDetectedGeometry.frameW = f.w;
+  gDetectedGeometry.frameH = f.h;
+  gDetectedGeometry.roi = roi;
+  gDetectedGeometry.target = target;
+  gDetectedGeometry.components = std::move(components);
+  return true;
+}
+void ResetInGameCache() { gDetectedGeometry = {}; }
 HWND OverlayWindow() { return gOverlayWnd; }
 void SetOverlayWindow(HWND hwnd) { gOverlayWnd = hwnd; }
 void SetUiThread() { gUiThreadId = GetCurrentThreadId(); }
@@ -1788,11 +1862,13 @@ bool RunSession(const std::function<bool()>& stopRequested,
     }
   };
   SolverCache cache;
+  InGameGeometry geometry = gDetectedGeometry;
   AutomationState automation;
   gRunning.store(true);
   RECT game{};
   if (!gta5::capture::GetGameClientRect(game)) {
     gRunning.store(false);
+    ResetInGameCache();
     return false;
   }
   gVirtualX = game.left; gVirtualY = game.top;
@@ -1805,8 +1881,19 @@ bool RunSession(const std::function<bool()>& stopRequested,
   while (!stopRequested()) {
     syncOverlay();
     Frame frame; FrameTiming timing;
-    if (!captureScreen(frame)) { Sleep(30); continue; }
-    OverlayState state = analyzeFrame(frame, cache, nullptr, &timing);
+    if (!captureScreen(frame)) {
+      geometry = {};
+      cache = {};
+      ResetInGameCache();
+      Sleep(30);
+      continue;
+    }
+    if (geometry.valid && geometry.windowGeneration != frame.windowGeneration) {
+      geometry = {};
+      cache = {};
+      ResetInGameCache();
+    }
+    OverlayState state = analyzeFrame(frame, cache, nullptr, &timing, &geometry);
     if (!timing.minigame) {
       ++invalidFrames;
       if (++lostFrames >= 15) {
@@ -1861,6 +1948,7 @@ bool RunSession(const std::function<bool()>& stopRequested,
   gRunning.store(false);
   resetAutomation(automation);
   ClearOverlay();
+  ResetInGameCache();
   return completedAnyLevel;
 }
 

@@ -14,6 +14,7 @@ HWND MarksWindow();
 void ClearOverlayState();
 void HideTransientOverlays();
 bool DetectInGame();
+void ResetInGameCache();
 void RunSession();
 int CursorSize();
 LRESULT CALLBACK CursorWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -22,6 +23,7 @@ LRESULT CALLBACK MarksWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 
 namespace gta5::games::flashing {
 bool DetectInGame();
+void ResetInGameCache();
 HWND OverlayWindow();
 void SetOverlayWindow(HWND hwnd);
 void HideOverlay();
@@ -33,6 +35,7 @@ LRESULT CALLBACK OverlayWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 
 namespace gta5::games::choose_fingerprint {
 bool DetectInGame();
+void ResetInGameCache();
 HWND OverlayWindow();
 void SetOverlayWindow(HWND hwnd);
 void SetUiThread();
@@ -47,6 +50,7 @@ LRESULT CALLBACK OverlayWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 
 namespace gta5::games::sort_fingerprint {
 bool DetectInGame();
+void ResetInGameCache();
 void SetOverlayWindow(HWND hwnd);
 void ClearOverlay();
 bool RunSession(const std::function<bool()>& stopRequested,
@@ -58,6 +62,7 @@ LRESULT CALLBACK OverlayWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 
 namespace gta5::games::fleeca {
 bool DetectInGame();
+void ResetInGameCache();
 bool RunSession(const std::function<bool()>& stopRequested,
                 const std::function<void(const std::wstring&)>& status);
 }  // namespace gta5::games::fleeca

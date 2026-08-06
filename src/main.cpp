@@ -84,6 +84,14 @@ void HideAllGameOverlays() {
   gta5::games::sort_fingerprint::ClearOverlay();
 }
 
+void ResetAllInGameCaches() {
+  gta5::games::slider::ResetInGameCache();
+  gta5::games::flashing::ResetInGameCache();
+  gta5::games::choose_fingerprint::ResetInGameCache();
+  gta5::games::sort_fingerprint::ResetInGameCache();
+  gta5::games::fleeca::ResetInGameCache();
+}
+
 GameKind DetectGame() {
   if (gta5::games::slider::DetectInGame()) return GameKind::Slider;
   if (gta5::games::flashing::DetectInGame()) return GameKind::Flashing;
@@ -246,6 +254,7 @@ void WorkerMain() {
   }
 
   HideAllGameOverlays();
+  ResetAllInGameCaches();
   gta5::capture::ClearGameWindow();
   gta5::app::runtime::SetRunning(false);
   gta5::app::ui::SetRunning(false);
@@ -255,6 +264,7 @@ void WorkerMain() {
 void StartWorker() {
   if (gta5::app::runtime::Running()) return;
   gta5::input::CancelAll();
+  ResetAllInGameCaches();
   gta5::input::ConfigureSequenceTiming(
       std::chrono::milliseconds(gta5::app::ui::TapHoldMs()),
       std::chrono::milliseconds(gta5::app::ui::TapGapMs()));

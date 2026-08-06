@@ -110,6 +110,7 @@ struct CaptureFrame {
   double toScreenY = 1.0;
   double analysisGeometryScale = 1.0;
   double screenGeometryScale = 1.0;
+  std::uint64_t windowGeneration = 0;
   std::vector<uint32_t> bgra;
 };
 
@@ -186,6 +187,17 @@ std::atomic<int> g_cursorTargetY{0};
 std::atomic<bool> g_cursorInZone{false};
 std::atomic<int> g_cursorBar{0};
 thread_local std::vector<int> g_rowCountScratch;
+
+struct InGameCache {
+  bool valid = false;
+  std::uint64_t windowGeneration = 0;
+  RedBar red;
+  std::vector<BarMeasure> bars;
+  SearchCells cells;
+  double geometryScale = 1.0;
+};
+
+InGameCache g_inGameCache;
 
 // All tunable pixel constants are authored for a 1080p game image.
 // Runtime geometry follows the GTA client height, including windowed mode.
@@ -320,6 +332,7 @@ bool CaptureScreenRegion(CaptureFrame& frame, const RectI* region, const RECT* s
   frame.h = captured.height;
   frame.toScreenX = captured.toScreenX;
   frame.toScreenY = captured.toScreenY;
+  frame.windowGeneration = captured.windowGeneration;
   const int gameHeight = captured.clientHeight;
   frame.analysisGeometryScale = std::clamp(std::min(gameHeight, 1080) / kBaselineScreenHeightPx, 0.45, 2.25);
   frame.screenGeometryScale = std::clamp(gameHeight / kBaselineScreenHeightPx, 0.45, 2.25);
@@ -828,6 +841,38 @@ FrameAnalysis AnalyzeLockedGeometry(const CaptureFrame& f, const RedBar& lockedR
     return analysis;
   }
 
+  const int redY = std::clamp(localRed.centerY, 0, f.h - 1);
+  const int redLeft = std::max(0, localRed.x1);
+  const int redRight = std::min(f.w - 1, localRed.x2);
+  const int redStep = std::max(1, (redRight - redLeft + 1) / 48);
+  int redHits = 0;
+  int redSamples = 0;
+  for (int x = redLeft; x <= redRight; x += redStep) {
+    ++redSamples;
+    bool hit = false;
+    for (int dy = -2; dy <= 2 && !hit; ++dy) {
+      const int y = redY + dy;
+      if (y >= 0 && y < f.h) hit = IsRed(Pixel(f, x, y));
+    }
+    redHits += hit;
+  }
+  if (redSamples < 4 || redHits * 100 < redSamples * 35) return analysis;
+
+  int visibleBars = 0;
+  int whiteBars = 0;
+  for (const auto& bar : lockedBarsScreen) {
+    const int x = ToFrameX(f, (bar.x1 + bar.x2) / 2);
+    if (x < 0 || x >= f.w) continue;
+    ++visibleBars;
+    int hits = 0;
+    for (int screenY : {bar.topY1, bar.topY2, bar.bottomY1, bar.bottomY2}) {
+      const int y = ToFrameY(f, screenY);
+      if (y >= 0 && y < f.h && IsWhite(Pixel(f, x, y))) ++hits;
+    }
+    if (hits >= 2) ++whiteBars;
+  }
+  if (visibleBars > 0 && whiteBars == 0) return analysis;
+
   analysis.ok = true;
   analysis.inMinigame = true;
   analysis.minigameStatus = L"in minigame";
@@ -1008,6 +1053,16 @@ void WorkerLoop() {
   SearchCells searchCellsScreen;
   bool cellsLocked = false;
   double geometryScale = 1.0;
+  std::uint64_t cachedWindowGeneration = 0;
+  if (g_inGameCache.valid) {
+    lockedRedScreen = g_inGameCache.red;
+    lastBarsScreen = g_inGameCache.bars;
+    searchCellsScreen = g_inGameCache.cells;
+    cellsLocked = searchCellsScreen.ok;
+    hasTrackingRegion = lockedRedScreen.ok && lastBarsScreen.size() >= 8 && cellsLocked;
+    cachedWindowGeneration = g_inGameCache.windowGeneration;
+    geometryScale = g_inGameCache.geometryScale;
+  }
   auto lastUiUpdate = std::chrono::steady_clock::now() - std::chrono::seconds(1);
   const auto activeSearchStart = std::chrono::steady_clock::now();
   bool activeFoundOnce = false;
@@ -1075,10 +1130,44 @@ void WorkerLoop() {
                                                 yellowCandidates, geometryScale,
                                                 yellowSearchHalf);
     }
-    if (!CaptureScreenRegion(frame, focusedCapture ? &trackingRegion : nullptr, &sessionClient)) {
+    if (!CaptureScreenRegion(frame, focusedCapture ? &trackingRegion : nullptr, nullptr)) {
+      if (focusedCapture) {
+        g_inGameCache = {};
+        hasTrackingRegion = false;
+        lockedRedScreen = {};
+        knownBarXRunsScreen.clear();
+        searchCellsScreen = {};
+        cellsLocked = false;
+        lastBarsScreen.clear();
+        cachedWindowGeneration = 0;
+        if (CaptureScreenRegion(frame, nullptr, nullptr)) {
+          PostLog(L"cached minigame region failed; retrying full frame");
+        } else {
+          PostStatus(L"capture failed");
+          std::this_thread::sleep_for(std::chrono::milliseconds(100));
+          continue;
+        }
+      } else {
+        g_inGameCache = {};
+        PostStatus(L"capture failed");
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        continue;
+      }
+    }
+    if (cachedWindowGeneration != 0 && frame.windowGeneration != cachedWindowGeneration) {
+      g_inGameCache = {};
+      hasTrackingRegion = false;
+      lockedRedScreen = {};
+      knownBarXRunsScreen.clear();
+      searchCellsScreen = {};
+      cellsLocked = false;
+      lastBarsScreen.clear();
+      cachedWindowGeneration = 0;
+      if (focusedCapture && !CaptureScreenRegion(frame, nullptr, nullptr)) {
       PostStatus(L"capture failed");
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
       continue;
+      }
     }
     auto sampleTime = std::chrono::steady_clock::now();
 
@@ -1090,6 +1179,11 @@ void WorkerLoop() {
       usedLockedGeometry = a.inMinigame;
     }
     if (!usedLockedGeometry) {
+      if (focusedCapture && !CaptureScreenRegion(frame, nullptr, nullptr)) {
+        PostStatus(L"capture failed");
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        continue;
+      }
       std::vector<std::pair<int, int>> knownBarXRunsLocal;
       if (knownBarXRunsScreen.size() == 8) {
         for (auto [x1, x2] : knownBarXRunsScreen) {
@@ -1117,6 +1211,7 @@ void WorkerLoop() {
       continue;
     }
     missFrames = 0;
+    cachedWindowGeneration = frame.windowGeneration;
     lockedRedScreen = a.red;
     lastBarsScreen = a.bars;
     geometryScale = frame.screenGeometryScale;
@@ -1147,7 +1242,7 @@ void WorkerLoop() {
     if (!yellow.ok && focusedCapture) {
       const RectI fallbackRegion =
           BuildFullYellowCaptureRegion(a.red, searchCellsScreen, geometryScale);
-      if (CaptureScreenRegion(frame, &fallbackRegion, &sessionClient)) {
+      if (CaptureScreenRegion(frame, &fallbackRegion, nullptr)) {
         sampleTime = std::chrono::steady_clock::now();
         FrameAnalysis fallbackAnalysis =
             AnalyzeLockedGeometry(frame, lockedRedScreen, lastBarsScreen);
@@ -1669,8 +1764,27 @@ void ClearOverlayState() {
   RequestMarksRepaint();
 }
 void HideTransientOverlays() { ClearOverlayState(); }
-bool DetectInGame() { CaptureFrame frame; if (!CaptureScreenRegion(frame, nullptr)) return false; return AnalyzeFrame(frame).inMinigame; }
-void RunSession() { WorkerLoop(); ClearOverlayState(); }
+bool DetectInGame() {
+  CaptureFrame frame;
+  if (!CaptureScreenRegion(frame, nullptr)) {
+    g_inGameCache = {};
+    return false;
+  }
+  FrameAnalysis analysis = AnalyzeFrame(frame);
+  if (!analysis.inMinigame) {
+    g_inGameCache = {};
+    return false;
+  }
+  g_inGameCache.valid = true;
+  g_inGameCache.windowGeneration = frame.windowGeneration;
+  g_inGameCache.red = analysis.red;
+  g_inGameCache.bars = analysis.bars;
+  g_inGameCache.cells = BuildSearchCellsFromWhiteBars(analysis.bars, frame.screenGeometryScale);
+  g_inGameCache.geometryScale = frame.screenGeometryScale;
+  return true;
+}
+void ResetInGameCache() { g_inGameCache = {}; }
+void RunSession() { WorkerLoop(); ClearOverlayState(); ResetInGameCache(); }
 int CursorSize() { return kCursorSize; }
 LRESULT CALLBACK CursorWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) { return CursorProc(hwnd, msg, wParam, lParam); }
 LRESULT CALLBACK MarksWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) { return MarksProc(hwnd, msg, wParam, lParam); }
