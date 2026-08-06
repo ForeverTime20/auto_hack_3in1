@@ -9,6 +9,7 @@ build.ps1
 *.lib
 *.a
 build/
+build-*/
 dist/
 
 # Local runtime files
