@@ -95,21 +95,25 @@ std::wstring FileNameOnly(const wchar_t* path) {
   return base;
 }
 
-bool ProcessExeNameEquals(DWORD processId, const wchar_t* exeName) {
+bool ProcessIsGta(DWORD processId) {
   HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
   if (!process) return false;
   wchar_t imagePath[MAX_PATH * 4]{};
   DWORD size = static_cast<DWORD>(std::size(imagePath));
-  const bool matches = QueryFullProcessImageNameW(process, 0, imagePath, &size) &&
-                       lstrcmpiW(FileNameOnly(imagePath).c_str(), exeName) == 0;
+  bool matches = false;
+  if (QueryFullProcessImageNameW(process, 0, imagePath, &size)) {
+    const std::wstring exeName = FileNameOnly(imagePath);
+    matches = lstrcmpiW(exeName.c_str(), L"GTA5_Enhanced.exe") == 0 ||
+              lstrcmpiW(exeName.c_str(), L"GTA5.exe") == 0;
+  }
   CloseHandle(process);
   return matches;
 }
 
 struct WindowSearch {
-  const wchar_t* exeName = nullptr;
   HWND window = nullptr;
   RECT rect{};
+  long long area = 0;
 };
 
 BOOL CALLBACK FindWindowProc(HWND hwnd, LPARAM parameter) {
@@ -119,20 +123,31 @@ BOOL CALLBACK FindWindowProc(HWND hwnd, LPARAM parameter) {
   if (!GetWindowRect(hwnd, &rect) || rect.right - rect.left < 100 || rect.bottom - rect.top < 100) return TRUE;
   DWORD processId = 0;
   GetWindowThreadProcessId(hwnd, &processId);
-  if (processId && ProcessExeNameEquals(processId, search->exeName)) {
+  const long long area = static_cast<long long>(rect.right - rect.left) * (rect.bottom - rect.top);
+  if (processId && area > search->area && ProcessIsGta(processId)) {
     search->window = hwnd;
     search->rect = rect;
-    return FALSE;
+    search->area = area;
   }
   return TRUE;
 }
 
-bool FindWindowRectByExe(const wchar_t* exeName, RECT& rect) {
-  WindowSearch search{exeName};
+bool FindGtaWindowRect(RECT& rect) {
+  WindowSearch search{};
   EnumWindows(FindWindowProc, reinterpret_cast<LPARAM>(&search));
   if (!search.window) return false;
   rect = search.rect;
   return true;
+}
+
+HMONITOR GtaMonitorOrCursorMonitor() {
+  RECT gtaWindow{};
+  if (FindGtaWindowRect(gtaWindow)) {
+    return MonitorFromRect(&gtaWindow, MONITOR_DEFAULTTONEAREST);
+  }
+  POINT cursor{};
+  GetCursorPos(&cursor);
+  return MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY);
 }
 
 std::wstring ExeSiblingPath(const wchar_t* fileName) {
@@ -1019,7 +1034,13 @@ void CenterWindow(HWND hwnd, int width, int height, HWND owner = nullptr) {
   RECT area{};
   if (owner && GetWindowRect(owner, &area)) {
   } else {
-    SystemParametersInfoW(SPI_GETWORKAREA, 0, &area, 0);
+    MONITORINFO info{sizeof(info)};
+    const HMONITOR monitor = GtaMonitorOrCursorMonitor();
+    if (GetMonitorInfoW(monitor, &info)) {
+      area = info.rcWork;
+    } else {
+      SystemParametersInfoW(SPI_GETWORKAREA, 0, &area, 0);
+    }
   }
   int x = area.left + ((area.right - area.left) - width) / 2;
   int y = area.top + ((area.bottom - area.top) - height) / 2;
@@ -1155,17 +1176,7 @@ void Repaint() {
 }
 
 RECT InitialHudRect() {
-  RECT anchor{};
-  HMONITOR monitor = nullptr;
-  if (FindWindowRectByExe(L"Rockstar Games Launcher.exe", anchor) ||
-      FindWindowRectByExe(L"steam.exe", anchor) ||
-      FindWindowRectByExe(L"EADesktop.exe", anchor)) {
-    monitor = MonitorFromRect(&anchor, MONITOR_DEFAULTTONEAREST);
-  } else {
-    POINT cursor{};
-    GetCursorPos(&cursor);
-    monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY);
-  }
+  const HMONITOR monitor = GtaMonitorOrCursorMonitor();
   MONITORINFO info{sizeof(info)};
   if (!GetMonitorInfoW(monitor, &info)) info.rcMonitor = VirtualDesktopRect();
   const int left = info.rcMonitor.right - CurrentWidth();
