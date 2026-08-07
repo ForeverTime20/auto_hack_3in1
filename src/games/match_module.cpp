@@ -780,7 +780,7 @@ bool RunSession(const std::function<bool()>& stopRequested,
       if (inputPhase == InputPhase::EnteringRight) {
         inputPhase = InputPhase::None;
         awaitingRightSelection = true;
-        rightSelectionDeadline = Clock::now() + std::chrono::milliseconds(1200);
+        rightSelectionDeadline = Clock::now() + std::chrono::milliseconds(200);
         rightStableFrames = 0;
         previousRight = -1;
       } else if (inputPhase == InputPhase::ConfirmingChoice) {
