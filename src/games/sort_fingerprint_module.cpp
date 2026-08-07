@@ -980,10 +980,31 @@ bool RunSession(const std::function<bool()>& stopRequested,
             else std::this_thread::yield();
         }
     };
+    auto beginNextRoundWait = [&](Clock::time_point now, const wchar_t* message) {
+        if (waitingForNextRound) return;
+        verificationPending = false;
+        ClearOverlayState();
+        waitingForNextRound = true;
+        nextRoundDeadline = now + std::chrono::seconds(5);
+        setStatus(L"sort_fingerprint: waiting next round");
+        log(message);
+    };
+    auto resumeNextRound = [&] {
+        waitingForNextRound = false;
+        verificationPending = false;
+        correctionAttempt = 0;
+        handledHash.reset();
+        setStatus(L"sort_fingerprint: analyzing next round");
+        log(L"sort_fingerprint: detected next round; reusing cached ROI geometry");
+    };
 
     setStatus(L"sort_fingerprint: locating");
     while (!stopRequested()) {
         const auto frameStarted = Clock::now();
+        if (waitingForNextRound && frameStarted >= nextRoundDeadline) {
+            log(L"sort_fingerprint: no next round within 5 seconds; completed");
+            break;
+        }
         SyncOverlayWindow(overlayEnabled());
         try {
             const auto now = Clock::now();
@@ -1001,6 +1022,10 @@ bool RunSession(const std::function<bool()>& stopRequested,
                 const auto headers = findHeaderBars(screen);
                 const auto anchors = selectAnchors(headers, screen.w, screen.h);
                 if (!anchors) {
+                    if (completedAnyRound) {
+                        beginNextRoundWait(now,
+                            L"sort_fingerprint: geometry lost after a completed round; waiting up to 5 seconds for next round");
+                    }
                     waitForNextFrame(frameStarted);
                     continue;
                 }
@@ -1008,8 +1033,12 @@ bool RunSession(const std::function<bool()>& stopRequested,
                 storedGeometry = RoiGeometry{located.anchors, located.frames};
                 storedGeneration = screen.windowGeneration;
                 PublishOverlay(screen, located, false);
-                setStatus(L"sort_fingerprint: analyzing");
-                log(L"sort_fingerprint: detected first round; cached ROI geometry");
+                if (waitingForNextRound) {
+                    resumeNextRound();
+                } else {
+                    setStatus(L"sort_fingerprint: analyzing");
+                    log(L"sort_fingerprint: detected first round; cached ROI geometry");
+                }
             } else if (!anchorsPresent(screen, storedGeometry->anchors)) {
                 if (!waitingForNextRound) {
                     const auto headers = findHeaderBars(screen);
@@ -1022,12 +1051,8 @@ bool RunSession(const std::function<bool()>& stopRequested,
                         PublishOverlay(screen, relocated, false);
                         log(L"sort_fingerprint: cached anchors failed; relocated in full frame");
                     } else {
-                        verificationPending = false;
-                        ClearOverlayState();
-                        waitingForNextRound = true;
-                        nextRoundDeadline = now + std::chrono::seconds(5);
-                        setStatus(L"sort_fingerprint: waiting next round");
-                        log(L"sort_fingerprint: minigame left; waiting up to 5 seconds for next round");
+                        beginNextRoundWait(now,
+                            L"sort_fingerprint: minigame left; waiting up to 5 seconds for next round");
                     }
                 }
 
@@ -1052,12 +1077,7 @@ bool RunSession(const std::function<bool()>& stopRequested,
                 }
             } else {
                 if (waitingForNextRound) {
-                    waitingForNextRound = false;
-                    verificationPending = false;
-                    correctionAttempt = 0;
-                    handledHash.reset();
-                    setStatus(L"sort_fingerprint: analyzing next round");
-                    log(L"sort_fingerprint: detected next round; reusing cached ROI geometry");
+                    resumeNextRound();
                 }
             }
 
@@ -1134,6 +1154,10 @@ bool RunSession(const std::function<bool()>& stopRequested,
             gDetectedGeneration = 0;
             const std::string what = error.what();
             const auto now = Clock::now();
+            if (completedAnyRound) {
+                beginNextRoundWait(now,
+                    L"sort_fingerprint: analysis lost after a completed round; waiting up to 5 seconds for next round");
+            }
             if (what != lastError || now - lastErrorTime >= std::chrono::seconds(2)) {
                 std::wstring message = L"sort_fingerprint: ROI not stable: ";
                 message.append(what.begin(), what.end());
