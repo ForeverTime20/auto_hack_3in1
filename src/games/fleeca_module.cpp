@@ -1086,12 +1086,17 @@ int run_live() {
 
 }  // namespace
 
-bool DetectInGame() {
+bool DetectInGame(const gta5::capture::GameFrame& captured) {
     Image frame;
-    if (!capture_client(frame)) {
-        g_detected_geometry = {};
-        return false;
-    }
+    frame.width = captured.width;
+    frame.height = captured.height;
+    frame.screen_x = captured.screenX;
+    frame.screen_y = captured.screenY;
+    frame.to_screen_x = captured.toScreenX;
+    frame.to_screen_y = captured.toScreenY;
+    frame.window_generation = captured.windowGeneration;
+    frame.bgra.resize(captured.bgra.size() * sizeof(std::uint32_t));
+    std::memcpy(frame.bgra.data(), captured.bgra.data(), frame.bgra.size());
     const auto connectors = find_connectors(frame);
     if (!connectors) {
         g_detected_geometry = {};

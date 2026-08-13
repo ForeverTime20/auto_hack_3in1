@@ -51,6 +51,7 @@ HWND g_flashingOverlay = nullptr;
 HWND g_chooseFingerprintOverlay = nullptr;
 HWND g_sortFingerprintOverlay = nullptr;
 HWND g_matchOverlay = nullptr;
+bool g_applyModeWhenWorkerStops = false;
 
 enum class GameKind {
   None,
@@ -102,15 +103,15 @@ void ResetAllInGameCaches() {
   gta5::games::match::ResetInGameCache();
 }
 
-GameKind DetectGame() {
-  if (gta5::games::slider::DetectInGame()) return GameKind::Slider;
-  if (gta5::games::flashing::DetectInGame()) return GameKind::Flashing;
-  if (gta5::games::choose_fingerprint::DetectInGame()) return GameKind::ChooseFingerprint;
-  if (gta5::games::sort_fingerprint::DetectInGame()) return GameKind::SortFingerprint;
-  if (gta5::games::fleeca::DetectInGame()) return GameKind::Fleeca;
+GameKind DetectGame(const gta5::capture::GameFrame& frame) {
+  if (gta5::games::slider::DetectInGame(frame)) return GameKind::Slider;
+  if (gta5::games::flashing::DetectInGame(frame)) return GameKind::Flashing;
+  if (gta5::games::choose_fingerprint::DetectInGame(frame)) return GameKind::ChooseFingerprint;
+  if (gta5::games::sort_fingerprint::DetectInGame(frame)) return GameKind::SortFingerprint;
+  if (gta5::games::fleeca::DetectInGame(frame)) return GameKind::Fleeca;
   // Its blue-bar signature is intentionally last so it cannot shadow older games.
-  if (gta5::games::find_number::DetectInGame()) return GameKind::FindNumber;
-  if (gta5::games::match::DetectInGame()) return GameKind::Match;
+  if (gta5::games::find_number::DetectInGame(frame)) return GameKind::FindNumber;
+  if (gta5::games::match::DetectInGame(frame)) return GameKind::Match;
   return GameKind::None;
 }
 
@@ -209,6 +210,7 @@ void ApplyWindowIcon(HWND hwnd) {
 
 void WorkerMain() {
   using Clock = std::chrono::steady_clock;
+  constexpr DWORD kDetectionPollIntervalMs = 30;
   gta5::app::runtime::ConfigureLatencySensitiveThread();
   PostLog(T("log.start"));
   PostStatus(T("status.search_game"));
@@ -216,6 +218,7 @@ void WorkerMain() {
 
   const auto deadline = Clock::now() + std::chrono::seconds(20);
   bool completed = false;
+  bool captureFailed = false;
   bool gameWindowFound = false;
   while (!gta5::app::runtime::StopRequested() && Clock::now() < deadline) {
     if (!gameWindowFound && !gta5::capture::FindGameWindow()) {
@@ -228,9 +231,27 @@ void WorkerMain() {
       PostStatus(T("status.search_minigame"));
       gameWindowFound = true;
     }
-    GameKind game = DetectGame();
+    gta5::capture::GameFrame detectionFrame;
+    const gta5::capture::CaptureStatus captureStatus =
+        gta5::capture::CaptureGameFrameStatus(detectionFrame);
+    if (captureStatus == gta5::capture::CaptureStatus::NoNewFrame) {
+      Sleep(kDetectionPollIntervalMs);
+      continue;
+    }
+    if (captureStatus == gta5::capture::CaptureStatus::Error) {
+      captureFailed = true;
+      PostLog(gta5::capture::CurrentBackend() == gta5::capture::Backend::DxgiExperimental
+                  ? L"DXGI capture failed; no fallback was used"
+                  : L"GDI capture failed");
+      PostStatus(T("status.capture_failed"));
+      break;
+    }
+    if (captureStatus != gta5::capture::CaptureStatus::NewFrame) {
+      continue;
+    }
+    GameKind game = DetectGame(detectionFrame);
     if (game == GameKind::None) {
-      Sleep(30);
+      Sleep(kDetectionPollIntervalMs);
       continue;
     }
 
@@ -289,7 +310,7 @@ void WorkerMain() {
     PostLog(gameWindowFound ? L"timeout: no supported minigame detected in 20s"
                             : L"timeout: GTA5 window not found in 20s");
     PostStatus(gameWindowFound ? T("status.detect_timeout") : T("status.game_timeout"));
-  } else {
+  } else if (!captureFailed) {
     PostStatus(completed ? T("status.completed") : T("status.stopped"));
   }
 
@@ -327,12 +348,6 @@ void StopWorker() {
   gta5::app::runtime::RequestStop();
   gta5::input::CancelAll();
   HideAllGameOverlays();
-  auto& worker = gta5::app::runtime::WorkerThread();
-  if (worker.joinable()) worker.join();
-  gta5::app::runtime::SetRunning(false);
-  gta5::app::ui::SetRunning(false);
-  PostStatus(T("status.stopped"));
-  gta5::app::ui::Repaint();
 }
 
 void DestroyGameOverlayWindows();
@@ -349,8 +364,9 @@ void ToggleAutomation() {
 
 LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
   if (msg == gta5::app::ui::ModeChangedMessage()) {
+    g_applyModeWhenWorkerStops = gta5::app::runtime::Running();
     StopWorker();
-    PostMessageW(hwnd, WM_APP + 21, 0, 0);
+    if (!g_applyModeWhenWorkerStops) PostMessageW(hwnd, WM_APP + 21, 0, 0);
     return 0;
   }
   if (msg == WM_APP + 21) {
@@ -409,15 +425,21 @@ LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       gta5::app::ui::SetRunning(false);
       auto& worker = gta5::app::runtime::WorkerThread();
       if (worker.joinable()) worker.detach();
+      if (g_applyModeWhenWorkerStops) {
+        g_applyModeWhenWorkerStops = false;
+        PostMessageW(hwnd, WM_APP + 21, 0, 0);
+      }
       gta5::app::ui::Repaint();
       return 0;
     }
     case WM_CLOSE:
       StopWorker();
+      if (gta5::app::runtime::WorkerThread().joinable()) {
+        gta5::app::runtime::WorkerThread().detach();
+      }
       DestroyWindow(hwnd);
       return 0;
     case WM_DESTROY:
-      StopWorker();
       DestroyGameOverlayWindows();
       PostQuitMessage(0);
       return 0;

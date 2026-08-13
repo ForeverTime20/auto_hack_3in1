@@ -1629,12 +1629,19 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 
-bool DetectInGame() {
+bool DetectInGame(const gta5::capture::GameFrame& captured) {
   ScreenShot shot;
-  if (!CaptureScreen(shot)) {
-    ResetInGameCache();
-    return false;
-  }
+  shot.screenX = captured.screenX;
+  shot.screenY = captured.screenY;
+  shot.screenW = captured.screenW;
+  shot.screenH = captured.screenH;
+  shot.w = captured.width;
+  shot.h = captured.height;
+  shot.toScreenX = captured.toScreenX;
+  shot.toScreenY = captured.toScreenY;
+  shot.windowGeneration = captured.windowGeneration;
+  shot.pixels.resize(captured.bgra.size() * sizeof(std::uint32_t));
+  std::memcpy(shot.pixels.data(), captured.bgra.data(), shot.pixels.size());
   MinigameGeometry geometry;
   if (!AnalyzeMinigamePage(shot, &geometry)) {
     ResetInGameCache();

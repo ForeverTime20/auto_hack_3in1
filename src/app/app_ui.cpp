@@ -1,5 +1,6 @@
 #include "app_ui.h"
 #include "localization.h"
+#include "../capture/game_window.h"
 
 #include <shellapi.h>
 #include <windowsx.h>
@@ -19,10 +20,13 @@ using gta5::app::l10n::Language;
 std::wstring T(const char* key) { return gta5::app::l10n::Text(key); }
 
 constexpr UINT kModeChangedMessage = WM_APP + 20;
+constexpr UINT kDesignDpi = 120;
 constexpr int kHudWidth = 320;
 constexpr int kHudMiniWidth = 232;
 constexpr int kHudMiniHeight = 44;
-constexpr int kHudExpandedHeight = 328;
+constexpr int kHudExpandedHeight = 356;
+constexpr int kSetupWidth = 600;
+constexpr int kSetupHeight = 480;
 constexpr int kHudMargin = 18;
 constexpr ULONGLONG kHudAutoCollapseMs = 5000;
 
@@ -57,6 +61,7 @@ std::atomic<int> g_delayPreset{static_cast<int>(DelayPreset::Fast)};
 std::atomic<bool> g_listeningHotkey{false};
 std::atomic<bool> g_panelExpanded{true};
 std::atomic<bool> g_overlayEnabled{true};
+std::atomic<int> g_captureBackend{static_cast<int>(gta5::capture::Backend::Gdi)};
 std::mutex g_textMutex;
 std::wstring g_status = L"idle";
 std::wstring g_lastLog;
@@ -67,6 +72,7 @@ bool g_dragging = false;
 POINT g_dragOffset{0, 0};
 ULONGLONG g_lastInteractionTick = 0;
 bool g_setupAccepted = false;
+gta5::capture::Backend g_setupCaptureBackend = gta5::capture::Backend::Gdi;
 bool g_toastEnabled = false;
 HICON g_dialogIcon = nullptr;
 LaunchMode g_setupMode = LaunchMode::Resident;
@@ -78,13 +84,47 @@ HBRUSH g_dialogEditBrush = nullptr;
 std::wstring g_hintText;
 int g_hoverTarget = 0;
 bool g_trackingHudMouse = false;
+UINT g_hudDpi = kDesignDpi;
+UINT g_setupDpi = kDesignDpi;
+UINT g_hintDpi = kDesignDpi;
+
+int ScaleForDpi(int value, UINT dpi) { return MulDiv(value, static_cast<int>(dpi), kDesignDpi); }
+
+RECT ScaleRectForDpi(RECT rect, UINT dpi) {
+  return RECT{ScaleForDpi(rect.left, dpi), ScaleForDpi(rect.top, dpi),
+              ScaleForDpi(rect.right, dpi), ScaleForDpi(rect.bottom, dpi)};
+}
+
+POINT ToDesignPoint(POINT point, UINT dpi) {
+  return POINT{MulDiv(point.x, kDesignDpi, static_cast<int>(dpi)),
+               MulDiv(point.y, kDesignDpi, static_cast<int>(dpi))};
+}
+
+UINT MonitorDpi(HMONITOR monitor) {
+  using GetDpiForMonitorFn = HRESULT(WINAPI*)(HMONITOR, int, UINT*, UINT*);
+  HMODULE shcore = LoadLibraryW(L"Shcore.dll");
+  if (shcore) {
+    auto getDpiForMonitor = reinterpret_cast<GetDpiForMonitorFn>(
+        GetProcAddress(shcore, "GetDpiForMonitor"));
+    UINT x = USER_DEFAULT_SCREEN_DPI;
+    UINT y = USER_DEFAULT_SCREEN_DPI;
+    if (getDpiForMonitor && SUCCEEDED(getDpiForMonitor(monitor, 0, &x, &y))) {
+      FreeLibrary(shcore);
+      return x;
+    }
+    FreeLibrary(shcore);
+  }
+  return GetDpiForSystem();
+}
 
 int CurrentHeight() {
-  return g_panelExpanded.load(std::memory_order_relaxed) ? kHudExpandedHeight : kHudMiniHeight;
+  return ScaleForDpi(g_panelExpanded.load(std::memory_order_relaxed)
+                         ? kHudExpandedHeight : kHudMiniHeight, g_hudDpi);
 }
 
 int CurrentWidth() {
-  return g_panelExpanded.load(std::memory_order_relaxed) ? kHudWidth : kHudMiniWidth;
+  return ScaleForDpi(g_panelExpanded.load(std::memory_order_relaxed)
+                         ? kHudWidth : kHudMiniWidth, g_hudDpi);
 }
 
 std::wstring FileNameOnly(const wchar_t* path) {
@@ -199,6 +239,7 @@ void SaveSettings() {
   out << "overlay_cursor=" << (g_overlayEnabled.load(std::memory_order_relaxed) ? 1 : 0) << "\n";
   out << "tap_hold_ms=" << g_tapHoldMs.load(std::memory_order_relaxed) << "\n";
   out << "tap_gap_ms=" << g_tapGapMs.load(std::memory_order_relaxed) << "\n";
+  out << "capture_backend=" << g_captureBackend.load(std::memory_order_relaxed) << "\n";
 }
 
 void LoadSettings() {
@@ -210,6 +251,7 @@ void LoadSettings() {
   int delayPreset = -1;
   int language = static_cast<int>(Language::Chinese);
   int setupComplete = 0;
+  int captureBackend = static_cast<int>(gta5::capture::Backend::Gdi);
   std::ifstream in(ExeSiblingPath(L"setting.ini").c_str());
   if (in) {
     std::string line;
@@ -227,6 +269,7 @@ void LoadSettings() {
         else if (key == "overlay_cursor") overlay = value;
         else if (key == "tap_hold_ms") tapHold = value;
         else if (key == "tap_gap_ms") tapGap = value;
+        else if (key == "capture_backend") captureBackend = value;
       } catch (...) {
       }
     }
@@ -251,11 +294,17 @@ void LoadSettings() {
     language = static_cast<int>(Language::Chinese);
   }
   gta5::app::l10n::SetLanguage(static_cast<Language>(language));
+  if (captureBackend < static_cast<int>(gta5::capture::Backend::Gdi) ||
+      captureBackend > static_cast<int>(gta5::capture::Backend::DxgiExperimental)) {
+    captureBackend = static_cast<int>(gta5::capture::Backend::Gdi);
+  }
 
   g_setupComplete = setupComplete == 1;
   g_hotkeyVk.store(hotkey, std::memory_order_relaxed);
   g_pendingHotkeyVk.store(hotkey, std::memory_order_relaxed);
   g_overlayEnabled.store(overlay != 0, std::memory_order_relaxed);
+  g_captureBackend.store(captureBackend, std::memory_order_relaxed);
+  gta5::capture::SetBackend(static_cast<gta5::capture::Backend>(captureBackend));
   g_tapHoldMs.store(tapHold, std::memory_order_relaxed);
   g_tapGapMs.store(tapGap, std::memory_order_relaxed);
   g_launchMode.store(launchMode, std::memory_order_relaxed);
@@ -277,9 +326,10 @@ RECT ClampRect(RECT panel) {
   if (!GetMonitorInfoW(monitor, &info)) info.rcMonitor = VirtualDesktopRect();
   const RECT& desktop = info.rcMonitor;
   const int minLeft = desktop.left;
-  const int minTop = desktop.top + kHudMargin;
+  const int margin = ScaleForDpi(kHudMargin, g_hudDpi);
+  const int minTop = desktop.top + margin;
   const int maxLeft = std::max(minLeft, static_cast<int>(desktop.right) - width);
-  const int maxTop = std::max(minTop, static_cast<int>(desktop.bottom) - height - kHudMargin);
+  const int maxTop = std::max(minTop, static_cast<int>(desktop.bottom) - height - margin);
   panel.left = std::clamp(static_cast<int>(panel.left), minLeft, maxLeft);
   panel.top = std::clamp(static_cast<int>(panel.top), minTop, maxTop);
   panel.right = panel.left + width;
@@ -287,24 +337,29 @@ RECT ClampRect(RECT panel) {
   return panel;
 }
 
-RECT PanelRect() { return RECT{0, 0, CurrentWidth(), CurrentHeight()}; }
+RECT PanelRect() {
+  return RECT{0, 0, g_panelExpanded.load(std::memory_order_relaxed) ? kHudWidth : kHudMiniWidth,
+              g_panelExpanded.load(std::memory_order_relaxed) ? kHudExpandedHeight : kHudMiniHeight};
+}
 RECT ExitRect(const RECT& p) { return RECT{p.right - 36, 10, p.right - 12, 34}; }
 RECT CollapseRect(const RECT& p) { return RECT{p.right - 66, 10, p.right - 42, 34}; }
 RECT HeaderRect(const RECT& p) { return RECT{0, 0, p.right, 46}; }
 RECT ResidentRect() { return RECT{16, 78, 156, 106}; }
 RECT SilentRect() { return RECT{164, 78, 304, 106}; }
-RECT HotkeyRect() { return RECT{86, 124, 190, 150}; }
-RECT HotkeyActionRect() { return RECT{198, 124, 304, 150}; }
-RECT AdminActionRect() { return RECT{198, 160, 304, 186}; }
-RECT FastRect() { return RECT{16, 216, 104, 244}; }
-RECT SlowRect() { return RECT{112, 216, 200, 244}; }
-RECT CustomRect() { return RECT{208, 216, 304, 244}; }
-RECT HoldEditRect() { return RECT{66, 254, 120, 280}; }
-RECT GapEditRect() { return RECT{212, 254, 266, 280}; }
-RECT OverlayRect() { return RECT{18, 296, 38, 316}; }
-RECT OverlayHintRect() { return RECT{16, 290, 194, 322}; }
-RECT ChineseRect() { return RECT{202, 294, 248, 318}; }
-RECT EnglishRect() { return RECT{256, 294, 304, 318}; }
+RECT HotkeyRect() { return RECT{86, 116, 190, 142}; }
+RECT HotkeyActionRect() { return RECT{198, 116, 304, 142}; }
+RECT AdminActionRect() { return RECT{198, 150, 304, 176}; }
+RECT FastRect() { return RECT{104, 184, 164, 212}; }
+RECT SlowRect() { return RECT{172, 184, 232, 212}; }
+RECT CustomRect() { return RECT{240, 184, 304, 212}; }
+RECT HoldEditRect() { return RECT{66, 222, 120, 248}; }
+RECT GapEditRect() { return RECT{212, 222, 266, 248}; }
+RECT CaptureGdiRect() { return RECT{16, 280, 156, 308}; }
+RECT CaptureDxgiRect() { return RECT{164, 280, 304, 308}; }
+RECT OverlayRect() { return RECT{18, 320, 38, 340}; }
+RECT OverlayHintRect() { return RECT{16, 314, 194, 346}; }
+RECT ChineseRect() { return RECT{202, 318, 248, 342}; }
+RECT EnglishRect() { return RECT{256, 318, 304, 342}; }
 bool Contains(RECT rect, POINT point) { return PtInRect(&rect, point) != FALSE; }
 
 bool RestartAsAdministrator(HWND owner) {
@@ -341,6 +396,8 @@ bool GetHoverHint(POINT point, int& target, RECT& anchor, std::wstring& text) {
       {7, OverlayHintRect(), "hint.overlay"},
       {8, ChineseRect(), "hint.language"},
       {9, EnglishRect(), "hint.language"},
+      {10, CaptureGdiRect(), "hint.capture_gdi"},
+      {11, CaptureDxgiRect(), "hint.capture_dxgi"},
   };
   for (const Hint& hint : hints) {
     if (Contains(hint.rect, point)) {
@@ -393,6 +450,22 @@ HFONT CreateUiFont(int height, int weight = FW_NORMAL) {
                      DEFAULT_PITCH | FF_DONTCARE, face);
 }
 
+HFONT CreateUiFontForDpi(int height, int weight, UINT dpi) {
+  const wchar_t* face = gta5::app::l10n::CurrentLanguage() == Language::Chinese
+                            ? L"Microsoft YaHei UI"
+                            : L"Segoe UI";
+  return CreateFontW(ScaleForDpi(height, dpi), 0, 0, 0, weight, FALSE, FALSE, FALSE,
+                     DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                     CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, face);
+}
+
+void SetDesignTransform(HDC hdc, UINT dpi) {
+  SetGraphicsMode(hdc, GM_ADVANCED);
+  const FLOAT scale = static_cast<FLOAT>(dpi) / static_cast<FLOAT>(kDesignDpi);
+  XFORM transform{scale, 0.0f, 0.0f, scale, 0.0f, 0.0f};
+  SetWorldTransform(hdc, &transform);
+}
+
 void DrawCenteredText(HDC hdc, RECT rect, const std::wstring& text, COLORREF color) {
   SetTextColor(hdc, color);
   DrawTextW(hdc, text.c_str(), static_cast<int>(text.size()), &rect,
@@ -439,7 +512,8 @@ void DrawPanel(HDC hdc, const RECT& panel) {
   HGDIOBJ oldBrush = SelectObject(hdc, panelBrush);
   SetBkMode(hdc, TRANSPARENT);
 
-  RoundRect(hdc, panel.left, panel.top, panel.right, panel.bottom, expanded ? 10 : 16, expanded ? 10 : 16);
+  RoundRect(hdc, panel.left + 1, panel.top + 1, panel.right - 1, panel.bottom - 1,
+            expanded ? 10 : 16, expanded ? 10 : 16);
   if (!expanded) {
     SelectObject(hdc, running ? runningBrush : accentBrush);
     SelectObject(hdc, GetStockObject(NULL_PEN));
@@ -493,10 +567,9 @@ void DrawPanel(HDC hdc, const RECT& panel) {
     DrawSegment(hdc, SilentRect(), T("mode.silent"), mode == LaunchMode::Silent,
                 accentBrush, normalBrush, accentPen);
 
-    SelectObject(hdc, labelFont);
-    SetTextColor(hdc, RGB(183, 196, 208));
-    DrawTextAt(hdc, 16, 128, T("panel.hotkey"));
     SelectObject(hdc, font);
+    SetTextColor(hdc, RGB(183, 196, 208));
+    DrawTextAt(hdc, 16, 120, T("panel.hotkey"));
     SelectObject(hdc, normalBrush);
     SelectObject(hdc, accentPen);
     const RECT hotkeyRect = HotkeyRect();
@@ -508,13 +581,13 @@ void DrawPanel(HDC hdc, const RECT& panel) {
                 accentBrush, normalBrush, accentPen);
 
     SetTextColor(hdc, RGB(183, 196, 208));
-    DrawTextAt(hdc, 16, 164, T("admin.try_prompt"));
+    DrawTextAt(hdc, 16, 154, T("admin.try_prompt"));
     DrawSegment(hdc, AdminActionRect(), T("admin.run"), false,
                 accentBrush, normalBrush, accentPen);
 
-    SelectObject(hdc, labelFont);
+    SelectObject(hdc, font);
     SetTextColor(hdc, RGB(124, 139, 153));
-    DrawTextAt(hdc, 16, 196, T("panel.key_delay"));
+    DrawTextAt(hdc, 16, 188, T("panel.key_delay"));
     const DelayPreset preset = static_cast<DelayPreset>(g_delayPreset.load(std::memory_order_relaxed));
     SelectObject(hdc, font);
     DrawSegment(hdc, FastRect(), T("delay.fast"), preset == DelayPreset::Fast,
@@ -525,26 +598,41 @@ void DrawPanel(HDC hdc, const RECT& panel) {
                 accentBrush, normalBrush, accentPen);
 
     SetTextColor(hdc, RGB(183, 196, 208));
-    DrawTextAt(hdc, 16, 258, T("delay.hold"));
-    DrawTextAt(hdc, 126, 258, T("unit.ms"));
-    DrawTextAt(hdc, 164, 258, T("delay.gap"));
-    DrawTextAt(hdc, 272, 258, T("unit.ms"));
+    DrawTextAt(hdc, 16, 226, T("delay.hold"));
+    DrawTextAt(hdc, 126, 226, T("unit.ms"));
+    DrawTextAt(hdc, 164, 226, T("delay.gap"));
+    DrawTextAt(hdc, 272, 226, T("unit.ms"));
     const bool customDelay = preset == DelayPreset::Custom;
     DrawEditFrame(hdc, HoldEditRect(), customDelay);
     DrawEditFrame(hdc, GapEditRect(), customDelay);
+
+    SelectObject(hdc, labelFont);
+    SetTextColor(hdc, RGB(124, 139, 153));
+    RECT captureTitle{16, 256, 304, 286};
+    const std::wstring captureTitleText = T("panel.capture");
+    DrawTextW(hdc, captureTitleText.c_str(), static_cast<int>(captureTitleText.size()),
+              &captureTitle, DT_LEFT | DT_VCENTER | DT_WORDBREAK | DT_NOPREFIX);
+    SelectObject(hdc, font);
+    const auto captureBackend = static_cast<gta5::capture::Backend>(g_captureBackend.load());
+    DrawSegment(hdc, CaptureGdiRect(), T("capture.gdi"),
+                captureBackend == gta5::capture::Backend::Gdi,
+                accentBrush, normalBrush, accentPen);
+    DrawSegment(hdc, CaptureDxgiRect(), T("capture.dxgi"),
+                captureBackend == gta5::capture::Backend::DxgiExperimental,
+                accentBrush, normalBrush, accentPen);
 
     const bool overlayAvailable = mode == LaunchMode::Resident;
     const bool overlayOn = overlayAvailable && g_overlayEnabled.load(std::memory_order_relaxed);
     SelectObject(hdc, overlayOn ? accentBrush : normalBrush);
     SelectObject(hdc, overlayAvailable ? accentPen : disabledPen);
-    Rectangle(hdc, 18, 296, 38, 316);
+    Rectangle(hdc, 18, 320, 38, 340);
     if (overlayOn) {
-      MoveToEx(hdc, 22, 306, nullptr);
-      LineTo(hdc, 27, 311);
-      LineTo(hdc, 35, 300);
+      MoveToEx(hdc, 22, 330, nullptr);
+      LineTo(hdc, 27, 335);
+      LineTo(hdc, 35, 324);
     }
     SetTextColor(hdc, overlayAvailable ? RGB(183, 196, 208) : RGB(103, 116, 128));
-    DrawTextAt(hdc, 48, 298, T(overlayAvailable ? "overlay.show" : "overlay.silent"));
+    DrawTextAt(hdc, 48, 322, T(overlayAvailable ? "overlay.show" : "overlay.silent"));
     DrawSegment(hdc, ChineseRect(), T("language.chinese"),
                 gta5::app::l10n::CurrentLanguage() == Language::Chinese,
                 accentBrush, normalBrush, accentPen);
@@ -552,6 +640,11 @@ void DrawPanel(HDC hdc, const RECT& panel) {
                 gta5::app::l10n::CurrentLanguage() == Language::English,
                 accentBrush, normalBrush, accentPen);
   }
+
+  SelectObject(hdc, GetStockObject(HOLLOW_BRUSH));
+  SelectObject(hdc, accentPen);
+  RoundRect(hdc, panel.left + 1, panel.top + 1, panel.right - 1, panel.bottom - 1,
+            expanded ? 10 : 16, expanded ? 10 : 16);
 
   SelectObject(hdc, oldFont);
   SelectObject(hdc, oldBrush);
@@ -585,6 +678,29 @@ HWND AddDarkEdit(HWND parent, const std::wstring& value, int x, int y, int w, in
   return edit;
 }
 
+void LayoutEdit(HWND parent, int id, RECT designRect, UINT dpi) {
+  HWND edit = GetDlgItem(parent, id);
+  if (!edit) return;
+  const RECT rect = ScaleRectForDpi(designRect, dpi);
+  SetWindowPos(edit, nullptr, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
+               SWP_NOZORDER | SWP_NOACTIVATE);
+  HFONT oldFont = reinterpret_cast<HFONT>(GetWindowLongPtrW(edit, GWLP_USERDATA));
+  HFONT font = CreateUiFontForDpi(22, FW_SEMIBOLD, dpi);
+  SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+  SetWindowLongPtrW(edit, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(font));
+  if (oldFont) DeleteObject(oldFont);
+}
+
+void LayoutHudEdits(HWND hwnd) {
+  LayoutEdit(hwnd, kDelayHold, HoldEditRect(), g_hudDpi);
+  LayoutEdit(hwnd, kDelayGap, GapEditRect(), g_hudDpi);
+}
+
+void LayoutSetupEdits(HWND hwnd) {
+  LayoutEdit(hwnd, kSetupHold, RECT{142, 296, 248, 322}, g_setupDpi);
+  LayoutEdit(hwnd, kSetupGap, RECT{424, 296, 530, 322}, g_setupDpi);
+}
+
 LRESULT CALLBACK HintProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
   switch (msg) {
     case WM_NCHITTEST:
@@ -600,11 +716,13 @@ LRESULT CALLBACK HintProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       HPEN border = CreatePen(PS_SOLID, 1, RGB(67, 205, 132));
       HGDIOBJ oldBrush = SelectObject(hdc, background);
       HGDIOBJ oldPen = SelectObject(hdc, border);
-      RoundRect(hdc, 0, 0, client.right, client.bottom, 8, 8);
-      HFONT font = CreateUiFont(18, FW_SEMIBOLD);
+      const int radius = ScaleForDpi(8, g_hintDpi);
+      RoundRect(hdc, 0, 0, client.right, client.bottom, radius, radius);
+      HFONT font = CreateUiFontForDpi(18, FW_SEMIBOLD, g_hintDpi);
       HGDIOBJ oldFont = SelectObject(hdc, font);
       SetBkMode(hdc, TRANSPARENT);
-      RECT textRect{12, 0, client.right - 12, client.bottom};
+      const int padding = ScaleForDpi(12, g_hintDpi);
+      RECT textRect{padding, 0, client.right - padding, client.bottom};
       DrawCenteredText(hdc, textRect, g_hintText, RGB(210, 221, 231));
       SelectObject(hdc, oldFont);
       SelectObject(hdc, oldPen);
@@ -641,18 +759,23 @@ void ShowHoverHint(HWND owner, int target, RECT anchor, const std::wstring& text
   }
   if (!registered) return;
 
-  constexpr int height = 42;
+  g_hintDpi = GetDpiForWindow(owner);
+  const int height = ScaleForDpi(42, g_hintDpi);
   SIZE textSize{};
   HDC measureDc = GetDC(owner);
-  HFONT measureFont = CreateUiFont(18, FW_SEMIBOLD);
+  HFONT measureFont = CreateUiFontForDpi(18, FW_SEMIBOLD, g_hintDpi);
   HGDIOBJ oldMeasureFont = SelectObject(measureDc, measureFont);
   GetTextExtentPoint32W(measureDc, text.c_str(), static_cast<int>(text.size()), &textSize);
   SelectObject(measureDc, oldMeasureFont);
   DeleteObject(measureFont);
   ReleaseDC(owner, measureDc);
   RECT desktop = VirtualDesktopRect();
-  const int maxWidth = std::max(120, static_cast<int>(desktop.right - desktop.left) - 24);
-  const int width = std::clamp(static_cast<int>(textSize.cx) + 24, 120, maxWidth);
+  const int minimumWidth = ScaleForDpi(120, g_hintDpi);
+  const int horizontalPadding = ScaleForDpi(24, g_hintDpi);
+  const int maxWidth = std::max(minimumWidth,
+      static_cast<int>(desktop.right - desktop.left) - horizontalPadding);
+  const int width = std::clamp(static_cast<int>(textSize.cx) + horizontalPadding,
+                               minimumWidth, maxWidth);
   if (!g_hintWnd) {
     g_hintWnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
                                 L"AutoHackHoverHintV1", L"", WS_POPUP,
@@ -660,15 +783,18 @@ void ShowHoverHint(HWND owner, int target, RECT anchor, const std::wstring& text
                                 GetModuleHandleW(nullptr), nullptr);
     if (!g_hintWnd) return;
   }
-  SetWindowRgn(g_hintWnd, CreateRoundRectRgn(0, 0, width, height, 8, 8), TRUE);
+  const int radius = ScaleForDpi(8, g_hintDpi);
+  SetWindowRgn(g_hintWnd, CreateRoundRectRgn(0, 0, width, height, radius, radius), TRUE);
 
-  POINT below{(anchor.left + anchor.right) / 2, anchor.bottom + 6};
+  anchor = ScaleRectForDpi(anchor, g_hintDpi);
+  const int gap = ScaleForDpi(6, g_hintDpi);
+  POINT below{(anchor.left + anchor.right) / 2, anchor.bottom + gap};
   ClientToScreen(owner, &below);
   int x = std::clamp(static_cast<int>(below.x) - width / 2, static_cast<int>(desktop.left),
                      std::max(static_cast<int>(desktop.left), static_cast<int>(desktop.right) - width));
   int y = below.y;
   if (y + height > desktop.bottom) {
-    POINT above{0, anchor.top - height - 6};
+    POINT above{0, anchor.top - height - gap};
     ClientToScreen(owner, &above);
     y = above.y;
   }
@@ -729,19 +855,20 @@ void SaveHudCustomDelay(HWND hwnd) {
 }
 
 void DrawDialogBase(HDC hdc, const RECT& client, const std::wstring& title,
-                    const std::wstring& subtitle, RECT closeRect) {
+                    const std::wstring& subtitle, RECT closeRect,
+                    int titleFontHeight = 29) {
   HBRUSH panel = CreateSolidBrush(RGB(16, 20, 25));
   HBRUSH header = CreateSolidBrush(RGB(24, 31, 38));
   HBRUSH danger = CreateSolidBrush(RGB(47, 27, 31));
   HPEN accent = CreatePen(PS_SOLID, 1, RGB(67, 205, 132));
   HPEN dangerPen = CreatePen(PS_SOLID, 2, RGB(240, 105, 105));
-  HFONT titleFont = CreateUiFont(29, FW_BOLD);
+  HFONT titleFont = CreateUiFont(titleFontHeight, FW_BOLD);
   HFONT bodyFont = CreateUiFont(21, FW_SEMIBOLD);
   HGDIOBJ oldBrush = SelectObject(hdc, panel);
   HGDIOBJ oldPen = SelectObject(hdc, accent);
   HGDIOBJ oldFont = SelectObject(hdc, titleFont);
   SetBkMode(hdc, TRANSPARENT);
-  RoundRect(hdc, 0, 0, client.right, client.bottom, 12, 12);
+  RoundRect(hdc, 1, 1, client.right - 1, client.bottom - 1, 12, 12);
   SelectObject(hdc, header);
   SelectObject(hdc, GetStockObject(NULL_PEN));
   const int headerHeight = subtitle.empty() ? 58 : 68;
@@ -760,6 +887,9 @@ void DrawDialogBase(HDC hdc, const RECT& client, const std::wstring& title,
   LineTo(hdc, closeRect.right - 7, closeRect.bottom - 7);
   MoveToEx(hdc, closeRect.right - 7, closeRect.top + 7, nullptr);
   LineTo(hdc, closeRect.left + 7, closeRect.bottom - 7);
+  SelectObject(hdc, GetStockObject(HOLLOW_BRUSH));
+  SelectObject(hdc, accent);
+  RoundRect(hdc, 1, 1, client.right - 1, client.bottom - 1, 12, 12);
   SelectObject(hdc, oldFont);
   SelectObject(hdc, oldPen);
   SelectObject(hdc, oldBrush);
@@ -785,13 +915,15 @@ void DrawEditFrame(HDC hdc, RECT rect, bool enabled) {
 RECT SetupCloseRect() { return RECT{558, 15, 586, 43}; }
 RECT SetupChineseRect() { return RECT{420, 15, 478, 43}; }
 RECT SetupEnglishRect() { return RECT{484, 15, 542, 43}; }
-RECT SetupResidentRect() { return RECT{162, 64, 360, 94}; }
-RECT SetupSilentRect() { return RECT{372, 64, 580, 94}; }
-RECT SetupFastRect() { return RECT{200, 210, 320, 240}; }
-RECT SetupSlowRect() { return RECT{330, 210, 450, 240}; }
-RECT SetupCustomRect() { return RECT{460, 210, 580, 240}; }
-RECT SetupCancelRect() { return RECT{358, 338, 464, 368}; }
-RECT SetupSaveRect() { return RECT{476, 338, 580, 368}; }
+RECT SetupResidentRect() { return RECT{200, 68, 385, 96}; }
+RECT SetupSilentRect() { return RECT{395, 68, 580, 96}; }
+RECT SetupFastRect() { return RECT{200, 208, 320, 236}; }
+RECT SetupSlowRect() { return RECT{330, 208, 450, 236}; }
+RECT SetupCustomRect() { return RECT{460, 208, 580, 236}; }
+RECT SetupGdiRect() { return RECT{200, 338, 385, 366}; }
+RECT SetupDxgiRect() { return RECT{395, 338, 580, 366}; }
+RECT SetupCancelRect() { return RECT{358, 440, 464, 468}; }
+RECT SetupSaveRect() { return RECT{476, 440, 580, 468}; }
 
 void SetSetupPreset(HWND hwnd, DelayPreset preset) {
   g_setupPreset = preset;
@@ -805,13 +937,15 @@ void SetSetupPreset(HWND hwnd, DelayPreset preset) {
 void DrawSetup(HWND hwnd, HDC hdc) {
   RECT client{};
   GetClientRect(hwnd, &client);
-  DrawDialogBase(hdc, client, T("setup.title"), L"", SetupCloseRect());
+  SetDesignTransform(hdc, g_setupDpi);
+  RECT designClient{0, 0, kSetupWidth, kSetupHeight};
+  DrawDialogBase(hdc, designClient, T("setup.title"), L"", SetupCloseRect(), 22);
   HFONT labelFont = CreateUiFont(20, FW_BOLD);
   HFONT bodyFont = CreateUiFont(22, FW_SEMIBOLD);
   HGDIOBJ oldFont = SelectObject(hdc, labelFont);
   SetBkMode(hdc, TRANSPARENT);
   SetTextColor(hdc, RGB(125, 141, 155));
-  DrawTextAt(hdc, 20, 70, T("setup.startup_mode"));
+  DrawTextAt(hdc, 20, 72, T("setup.startup_mode"));
   HBRUSH accentBrush = CreateSolidBrush(RGB(79, 220, 145));
   HBRUSH normalBrush = CreateSolidBrush(RGB(35, 43, 51));
   HPEN accentPen = CreatePen(PS_SOLID, 1, RGB(67, 205, 132));
@@ -826,11 +960,11 @@ void DrawSetup(HWND hwnd, HDC hdc) {
               accentBrush, normalBrush, accentPen);
   DrawSegment(hdc, SetupSilentRect(), T("mode.silent"), g_setupMode == LaunchMode::Silent,
               accentBrush, normalBrush, accentPen);
-  HFONT detailFont = CreateUiFont(18, FW_SEMIBOLD);
+  HFONT detailFont = CreateUiFont(20, FW_SEMIBOLD);
   SelectObject(hdc, detailFont);
   SetTextColor(hdc, RGB(176, 190, 202));
-  RECT residentCopy{24, 104, 576, 146};
-  RECT silentCopy{24, 148, 576, 204};
+  RECT residentCopy{24, 102, 576, 144};
+  RECT silentCopy{24, 146, 576, 198};
   const std::wstring residentParagraph = T("setup.resident_desc");
   const std::wstring silentParagraph = T("setup.silent_desc");
   DrawTextW(hdc, residentParagraph.c_str(), -1, &residentCopy,
@@ -840,7 +974,7 @@ void DrawSetup(HWND hwnd, HDC hdc) {
 
   SelectObject(hdc, labelFont);
   SetTextColor(hdc, RGB(125, 141, 155));
-  DrawTextAt(hdc, 20, 216, T("setup.default_delay"));
+  DrawTextAt(hdc, 20, 212, T("setup.default_delay"));
   SelectObject(hdc, bodyFont);
   DrawSegment(hdc, SetupFastRect(), T("delay.fast_values"), g_setupPreset == DelayPreset::Fast,
               accentBrush, normalBrush, accentPen);
@@ -849,7 +983,7 @@ void DrawSetup(HWND hwnd, HDC hdc) {
   DrawSegment(hdc, SetupCustomRect(), T("delay.custom"), g_setupPreset == DelayPreset::Custom,
               accentBrush, normalBrush, accentPen);
   SelectObject(hdc, detailFont);
-  RECT delayCopy{24, 246, 576, 304};
+  RECT delayCopy{24, 242, 576, 294};
   SetTextColor(hdc, RGB(176, 190, 202));
   const std::wstring delayText = T("setup.delay_desc");
   if (g_setupError.empty()) {
@@ -859,16 +993,33 @@ void DrawSetup(HWND hwnd, HDC hdc) {
 
   const bool custom = g_setupPreset == DelayPreset::Custom;
   SetTextColor(hdc, custom ? RGB(186, 199, 211) : RGB(94, 106, 116));
-  DrawTextAt(hdc, 24, 314, T("setup.duration"));
-  DrawTextAt(hdc, 306, 314, T("setup.interval"));
-  DrawTextAt(hdc, 258, 314, T("unit.ms"));
-  DrawTextAt(hdc, 540, 314, T("unit.ms"));
-  DrawEditFrame(hdc, RECT{142, 306, 248, 332}, custom);
-  DrawEditFrame(hdc, RECT{424, 306, 530, 332}, custom);
+  DrawTextAt(hdc, 24, 304, T("setup.duration"));
+  DrawTextAt(hdc, 306, 304, T("setup.interval"));
+  DrawTextAt(hdc, 258, 304, T("unit.ms"));
+  DrawTextAt(hdc, 540, 304, T("unit.ms"));
+  DrawEditFrame(hdc, RECT{142, 296, 248, 322}, custom);
+  DrawEditFrame(hdc, RECT{424, 296, 530, 322}, custom);
   if (!g_setupError.empty()) {
     SetTextColor(hdc, RGB(245, 125, 125));
     TextOutW(hdc, 24, 270, g_setupError.c_str(), static_cast<int>(g_setupError.size()));
   }
+
+  SelectObject(hdc, labelFont);
+  SetTextColor(hdc, RGB(125, 141, 155));
+  DrawTextAt(hdc, 20, 342, T("setup.capture"));
+  SelectObject(hdc, bodyFont);
+  DrawSegment(hdc, SetupGdiRect(), T("capture.gdi"),
+              g_setupCaptureBackend == gta5::capture::Backend::Gdi,
+              accentBrush, normalBrush, accentPen);
+  DrawSegment(hdc, SetupDxgiRect(), T("capture.dxgi"),
+              g_setupCaptureBackend == gta5::capture::Backend::DxgiExperimental,
+              accentBrush, normalBrush, accentPen);
+  SelectObject(hdc, detailFont);
+  SetTextColor(hdc, RGB(176, 190, 202));
+  RECT captureCopy{24, 372, 576, 432};
+  const std::wstring captureText = T("setup.capture_desc");
+  DrawTextW(hdc, captureText.c_str(), -1, &captureCopy,
+            DT_LEFT | DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL);
   DrawSegment(hdc, SetupCancelRect(), T("action.cancel"), false, accentBrush, normalBrush, accentPen);
   DrawSegment(hdc, SetupSaveRect(), T("action.start"), true, accentBrush, normalBrush, accentPen);
   SelectObject(hdc, oldFont);
@@ -883,14 +1034,33 @@ void DrawSetup(HWND hwnd, HDC hdc) {
 LRESULT CALLBACK SetupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
   switch (msg) {
     case WM_CREATE: {
-      SetWindowRgn(hwnd, CreateRoundRectRgn(0, 0, 600, 380, 14, 14), TRUE);
+      g_setupDpi = GetDpiForWindow(hwnd);
+      SetWindowRgn(hwnd, CreateRoundRectRgn(0, 0, ScaleForDpi(kSetupWidth, g_setupDpi),
+                                            ScaleForDpi(kSetupHeight, g_setupDpi),
+                                            ScaleForDpi(14, g_setupDpi),
+                                            ScaleForDpi(14, g_setupDpi)), TRUE);
       if (g_dialogIcon) {
         SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(g_dialogIcon));
         SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(g_dialogIcon));
       }
-      AddDarkEdit(hwnd, std::to_wstring(TapHoldMs()), 142, 306, 106, 26, kSetupHold);
-      AddDarkEdit(hwnd, std::to_wstring(TapGapMs()), 424, 306, 106, 26, kSetupGap);
+      AddDarkEdit(hwnd, std::to_wstring(TapHoldMs()), 142, 296, 106, 26, kSetupHold);
+      AddDarkEdit(hwnd, std::to_wstring(TapGapMs()), 424, 296, 106, 26, kSetupGap);
+      LayoutSetupEdits(hwnd);
       SetSetupPreset(hwnd, g_setupPreset);
+      return 0;
+    }
+    case WM_DPICHANGED: {
+      g_setupDpi = HIWORD(wp);
+      const RECT* suggested = reinterpret_cast<const RECT*>(lp);
+      SetWindowPos(hwnd, nullptr, suggested->left, suggested->top,
+                   ScaleForDpi(kSetupWidth, g_setupDpi), ScaleForDpi(kSetupHeight, g_setupDpi),
+                   SWP_NOZORDER | SWP_NOACTIVATE);
+      SetWindowRgn(hwnd, CreateRoundRectRgn(0, 0, ScaleForDpi(kSetupWidth, g_setupDpi),
+                                            ScaleForDpi(kSetupHeight, g_setupDpi),
+                                            ScaleForDpi(14, g_setupDpi),
+                                            ScaleForDpi(14, g_setupDpi)), TRUE);
+      LayoutSetupEdits(hwnd);
+      InvalidateRect(hwnd, nullptr, FALSE);
       return 0;
     }
     case WM_CTLCOLOREDIT:
@@ -902,7 +1072,7 @@ LRESULT CALLBACK SetupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       return reinterpret_cast<LRESULT>(g_dialogEditBrush);
     }
     case WM_LBUTTONDOWN: {
-      POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+      POINT pt = ToDesignPoint(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}, g_setupDpi);
       if (Contains(SetupCloseRect(), pt) || Contains(SetupCancelRect(), pt)) {
         DestroyWindow(hwnd);
       } else if (Contains(SetupChineseRect(), pt) || Contains(SetupEnglishRect(), pt)) {
@@ -921,6 +1091,11 @@ LRESULT CALLBACK SetupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       } else if (Contains(SetupCustomRect(), pt)) {
         SetSetupPreset(hwnd, DelayPreset::Custom);
         SetFocus(GetDlgItem(hwnd, kSetupHold));
+      } else if (Contains(SetupGdiRect(), pt) || Contains(SetupDxgiRect(), pt)) {
+        g_setupCaptureBackend = Contains(SetupDxgiRect(), pt)
+                                    ? gta5::capture::Backend::DxgiExperimental
+                                    : gta5::capture::Backend::Gdi;
+        InvalidateRect(hwnd, nullptr, FALSE);
       } else if (Contains(SetupSaveRect(), pt)) {
         int hold = 20;
         int gap = 20;
@@ -934,6 +1109,8 @@ LRESULT CALLBACK SetupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_delayPreset.store(static_cast<int>(g_setupPreset), std::memory_order_relaxed);
         g_tapHoldMs.store(hold, std::memory_order_relaxed);
         g_tapGapMs.store(gap, std::memory_order_relaxed);
+        g_captureBackend.store(static_cast<int>(g_setupCaptureBackend), std::memory_order_relaxed);
+        gta5::capture::SetBackend(g_setupCaptureBackend);
         g_setupComplete = true;
         SaveSettings();
         g_setupAccepted = true;
@@ -1077,19 +1254,21 @@ bool RunFirstLaunchSetup(HINSTANCE instance, HICON icon) {
   g_setupAccepted = false;
   g_setupMode = CurrentLaunchMode();
   g_setupPreset = static_cast<DelayPreset>(g_delayPreset.load(std::memory_order_relaxed));
+  g_setupCaptureBackend = static_cast<gta5::capture::Backend>(
+      g_captureBackend.load(std::memory_order_relaxed));
   g_setupError.clear();
   if (!g_dialogEditBrush) g_dialogEditBrush = CreateSolidBrush(RGB(28, 35, 42));
-  DPI_AWARENESS_CONTEXT previousDpi =
-      SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED);
+  const HMONITOR monitor = GtaMonitorOrCursorMonitor();
+  g_setupDpi = MonitorDpi(monitor);
+  const int setupWidth = ScaleForDpi(kSetupWidth, g_setupDpi);
+  const int setupHeight = ScaleForDpi(kSetupHeight, g_setupDpi);
   HWND hwnd = CreateWindowExW(WS_EX_APPWINDOW, L"AutoHackFirstLaunchV1", T("setup.title").c_str(),
-                              WS_POPUP, CW_USEDEFAULT, CW_USEDEFAULT, 600, 380,
+                              WS_POPUP, CW_USEDEFAULT, CW_USEDEFAULT, setupWidth, setupHeight,
                               nullptr, nullptr, instance, nullptr);
-  if (!hwnd) {
-    if (previousDpi) SetThreadDpiAwarenessContext(previousDpi);
-    return false;
-  }
-  CenterWindow(hwnd, 600, 380);
-  if (previousDpi) SetThreadDpiAwarenessContext(previousDpi);
+  if (!hwnd) return false;
+  g_setupDpi = GetDpiForWindow(hwnd);
+  CenterWindow(hwnd, ScaleForDpi(kSetupWidth, g_setupDpi),
+               ScaleForDpi(kSetupHeight, g_setupDpi));
   RunModalWindow(hwnd);
   return g_setupAccepted;
 }
@@ -1177,6 +1356,7 @@ void Repaint() {
 
 RECT InitialHudRect() {
   const HMONITOR monitor = GtaMonitorOrCursorMonitor();
+  g_hudDpi = MonitorDpi(monitor);
   MONITORINFO info{sizeof(info)};
   if (!GetMonitorInfoW(monitor, &info)) info.rcMonitor = VirtualDesktopRect();
   const int left = info.rcMonitor.right - CurrentWidth();
@@ -1255,6 +1435,7 @@ LRESULT CALLBACK HudProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       if (g_hostWnd) PostMessageW(g_hostWnd, WM_CLOSE, 0, 0);
       return 0;
     case WM_CREATE: {
+      g_hudDpi = GetDpiForWindow(hwnd);
       if (!g_dialogEditBrush) g_dialogEditBrush = CreateSolidBrush(RGB(28, 35, 42));
       const RECT hold = HoldEditRect();
       const RECT gap = GapEditRect();
@@ -1262,8 +1443,20 @@ LRESULT CALLBACK HudProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                   hold.right - hold.left, hold.bottom - hold.top, kDelayHold);
       AddDarkEdit(hwnd, std::to_wstring(TapGapMs()), gap.left, gap.top,
                   gap.right - gap.left, gap.bottom - gap.top, kDelayGap);
+      LayoutHudEdits(hwnd);
       SyncHudDelayControls(hwnd);
       SetTimer(hwnd, 1, 100, nullptr);
+      return 0;
+    }
+    case WM_DPICHANGED: {
+      g_hudDpi = HIWORD(wp);
+      HideHoverHint();
+      const RECT* suggested = reinterpret_cast<const RECT*>(lp);
+      SetWindowPos(hwnd, SilentMode() ? HWND_NOTOPMOST : HWND_TOPMOST,
+                   suggested->left, suggested->top, CurrentWidth(), CurrentHeight(),
+                   SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+      LayoutHudEdits(hwnd);
+      InvalidateRect(hwnd, nullptr, FALSE);
       return 0;
     }
     case WM_CTLCOLOREDIT:
@@ -1294,11 +1487,13 @@ LRESULT CALLBACK HudProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_NCHITTEST: {
       POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
       ScreenToClient(hwnd, &pt);
+      pt = ToDesignPoint(pt, g_hudDpi);
       RECT panel = PanelRect();
       return PtInRect(&panel, pt) ? HTCLIENT : HTTRANSPARENT;
     }
     case WM_LBUTTONDOWN: {
-      POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+      POINT physicalPt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+      POINT pt = ToDesignPoint(physicalPt, g_hudDpi);
       RECT panel = PanelRect();
       if (!g_panelExpanded.load(std::memory_order_relaxed)) {
         Expand(hwnd);
@@ -1357,6 +1552,17 @@ LRESULT CALLBACK HudProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SetOverlayEnabled(!g_overlayEnabled.load(std::memory_order_relaxed));
         return 0;
       }
+      if (Contains(CaptureGdiRect(), pt) || Contains(CaptureDxgiRect(), pt)) {
+        if (g_running.load(std::memory_order_relaxed)) return 0;
+        const auto backend = Contains(CaptureDxgiRect(), pt)
+                                 ? gta5::capture::Backend::DxgiExperimental
+                                 : gta5::capture::Backend::Gdi;
+        g_captureBackend.store(static_cast<int>(backend), std::memory_order_relaxed);
+        gta5::capture::SetBackend(backend);
+        SaveSettings();
+        Repaint();
+        return 0;
+      }
       if (Contains(ChineseRect(), pt) || Contains(EnglishRect(), pt)) {
         gta5::app::l10n::SetLanguage(Contains(EnglishRect(), pt)
                                          ? Language::English
@@ -1372,7 +1578,7 @@ LRESULT CALLBACK HudProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       }
       if (Contains(HeaderRect(panel), pt) && !Contains(ExitRect(panel), pt)) {
         g_dragging = true;
-        g_dragOffset = POINT{pt.x, pt.y};
+        g_dragOffset = physicalPt;
         SetCapture(hwnd);
       }
       return 0;
@@ -1385,7 +1591,8 @@ LRESULT CALLBACK HudProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
           TrackMouseEvent(&tracking);
           g_trackingHudMouse = true;
         }
-        POINT hoverPoint{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        POINT hoverPoint = ToDesignPoint(
+            POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}, g_hudDpi);
         int target = 0;
         RECT anchor{};
         std::wstring hint;
@@ -1419,7 +1626,7 @@ LRESULT CALLBACK HudProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
       }
       if (g_panelExpanded.load(std::memory_order_relaxed)) {
-        POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        POINT pt = ToDesignPoint(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}, g_hudDpi);
         if (Contains(ExitRect(PanelRect()), pt) && g_hostWnd) PostMessageW(g_hostWnd, WM_CLOSE, 0, 0);
       }
       return 0;
@@ -1442,7 +1649,9 @@ LRESULT CALLBACK HudProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       HBRUSH clear = CreateSolidBrush(RGB(0, 0, 0));
       FillRect(memoryDc, &rc, clear);
       DeleteObject(clear);
+      SetDesignTransform(memoryDc, g_hudDpi);
       DrawPanel(memoryDc, PanelRect());
+      ModifyWorldTransform(memoryDc, nullptr, MWT_IDENTITY);
       BitBlt(paintDc, 0, 0, rc.right, rc.bottom, memoryDc, 0, 0, SRCCOPY);
       SelectObject(memoryDc, oldBitmap);
       DeleteObject(buffer);

@@ -1769,12 +1769,18 @@ void ClearOverlayState() {
   RequestMarksRepaint();
 }
 void HideTransientOverlays() { ClearOverlayState(); }
-bool DetectInGame() {
+bool DetectInGame(const gta5::capture::GameFrame& captured) {
   CaptureFrame frame;
-  if (!CaptureScreenRegion(frame, nullptr)) {
-    g_inGameCache = {};
-    return false;
-  }
+  frame.x = captured.screenX;
+  frame.y = captured.screenY;
+  frame.w = captured.width;
+  frame.h = captured.height;
+  frame.toScreenX = captured.toScreenX;
+  frame.toScreenY = captured.toScreenY;
+  frame.windowGeneration = captured.windowGeneration;
+  frame.analysisGeometryScale = std::clamp(std::min(captured.clientHeight, 1080) / kBaselineScreenHeightPx, 0.45, 2.25);
+  frame.screenGeometryScale = std::clamp(captured.clientHeight / kBaselineScreenHeightPx, 0.45, 2.25);
+  frame.bgra = captured.bgra;
   FrameAnalysis analysis = AnalyzeFrame(frame);
   if (!analysis.inMinigame) {
     g_inGameCache = {};

@@ -8,6 +8,21 @@
 
 namespace gta5::capture {
 
+enum class Backend {
+  Gdi = 0,
+  DxgiExperimental = 1,
+};
+
+enum class CaptureStatus {
+  NewFrame,
+  NoNewFrame,
+  Error,
+};
+
+void SetBackend(Backend backend);
+Backend CurrentBackend();
+bool LastCaptureSucceeded();
+
 bool FindGameWindow();
 bool GetGameClientRect(RECT& rect);
 void ClearGameWindow();
@@ -29,6 +44,7 @@ struct GameFrame {
 };
 
 bool CaptureGameFrame(GameFrame& frame, const RECT* screenRegion = nullptr);
+CaptureStatus CaptureGameFrameStatus(GameFrame& frame, const RECT* screenRegion = nullptr);
 bool CaptureGameFrameFromClientRect(GameFrame& frame, const RECT& clientRect,
                                     const RECT* screenRegion = nullptr);
 

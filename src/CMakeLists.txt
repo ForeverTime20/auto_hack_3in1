@@ -10,6 +10,8 @@ add_executable(${PROJECT_NAME} WIN32
     app/app_runtime.h
     capture/game_window.cpp
     capture/game_window.h
+    capture/dxgi_capture.cpp
+    capture/dxgi_capture.h
     resources/app.rc
     resources/resource.h
 )
@@ -31,6 +33,8 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     gdiplus
     comctl32
     dwmapi
+    d3d11
+    dxgi
 )
 
 # --- MSVC-specific settings ---

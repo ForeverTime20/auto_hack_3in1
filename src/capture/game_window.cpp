@@ -1,4 +1,5 @@
 #include "game_window.h"
+#include "dxgi_capture.h"
 
 #include <tlhelp32.h>
 
@@ -7,6 +8,7 @@
 #include <cmath>
 #include <cstring>
 #include <mutex>
+#include <atomic>
 #include <unordered_set>
 
 namespace gta5::capture {
@@ -17,6 +19,8 @@ HWND gWindow = nullptr;
 RECT gClientRect{};
 bool gHasClientRect = false;
 std::uint64_t gWindowGeneration = 1;
+std::atomic<int> gBackend{static_cast<int>(Backend::Gdi)};
+std::atomic<bool> gLastCaptureSucceeded{true};
 
 bool ReadClientRect(HWND window, RECT& rect) {
   if (!window || !IsWindow(window) || !IsWindowVisible(window) || IsIconic(window)) return false;
@@ -124,6 +128,7 @@ bool GetGameClientRect(RECT& rect) {
 }
 
 void ClearGameWindow() {
+  dxgi::Stop();
   std::lock_guard<std::mutex> lock(gMutex);
   if (gWindow || gHasClientRect) ++gWindowGeneration;
   gWindow = nullptr;
@@ -177,21 +182,48 @@ thread_local CaptureResources gCapture;
 
 }  // namespace
 
-bool CaptureGameFrame(GameFrame& frame, const RECT* screenRegion) {
+void SetBackend(Backend backend) {
+  const Backend previous = CurrentBackend();
+  gBackend.store(static_cast<int>(backend), std::memory_order_relaxed);
+  if (previous == Backend::DxgiExperimental && backend != previous) dxgi::Stop();
+}
+Backend CurrentBackend() { return static_cast<Backend>(gBackend.load(std::memory_order_relaxed)); }
+bool LastCaptureSucceeded() { return gLastCaptureSucceeded.load(std::memory_order_relaxed); }
+
+CaptureStatus CaptureGameFrameStatus(GameFrame& frame, const RECT* screenRegion) {
   RECT client{};
   std::uint64_t generation = 0;
   {
     std::lock_guard<std::mutex> lock(gMutex);
-    if (!RefreshWindowLocked()) return false;
+    if (!RefreshWindowLocked()) {
+      gLastCaptureSucceeded.store(false, std::memory_order_relaxed);
+      return CaptureStatus::Error;
+    }
     client = gClientRect;
     generation = gWindowGeneration;
   }
-  if (!CaptureGameFrameFromClientRect(frame, client, screenRegion)) return false;
-  frame.windowGeneration = generation;
-  return true;
+  if (CurrentBackend() == Backend::DxgiExperimental) {
+    const CaptureStatus status = dxgi::CaptureLatest(frame, client, screenRegion);
+    gLastCaptureSucceeded.store(status != CaptureStatus::Error, std::memory_order_relaxed);
+    if (status == CaptureStatus::NewFrame) frame.windowGeneration = generation;
+    return status;
+  }
+  const bool succeeded = CaptureGameFrameFromClientRect(frame, client, screenRegion);
+  gLastCaptureSucceeded.store(succeeded, std::memory_order_relaxed);
+  if (succeeded) {
+    frame.windowGeneration = generation;
+  }
+  return succeeded ? CaptureStatus::NewFrame : CaptureStatus::Error;
+}
+
+bool CaptureGameFrame(GameFrame& frame, const RECT* screenRegion) {
+  return CaptureGameFrameStatus(frame, screenRegion) == CaptureStatus::NewFrame;
 }
 
 bool CaptureGameFrameFromClientRect(GameFrame& frame, const RECT& client, const RECT* screenRegion) {
+  if (CurrentBackend() == Backend::DxgiExperimental) {
+    return dxgi::CaptureLatest(frame, client, screenRegion) == CaptureStatus::NewFrame;
+  }
   RECT source = client;
   if (screenRegion) {
     if (!IntersectRect(&source, &client, screenRegion)) return false;

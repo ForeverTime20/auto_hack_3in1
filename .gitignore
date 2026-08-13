@@ -1,5 +1,4 @@
 # Build outputs
-build.ps1
 *.exe
 *.dll
 *.obj
@@ -23,3 +22,7 @@ debug.log
 *.suo
 Thumbs.db
 Desktop.ini
+
+# Local vision test frames
+sample_choosefingerprint.jpg
+sample_flashing.jpg

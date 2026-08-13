@@ -4,6 +4,7 @@
 
 #include <functional>
 #include <string>
+#include "../capture/game_window.h"
 
 namespace gta5::games::slider {
 void SetHostWindow(HWND hwnd);
@@ -13,7 +14,7 @@ HWND CursorWindow();
 HWND MarksWindow();
 void ClearOverlayState();
 void HideTransientOverlays();
-bool DetectInGame();
+bool DetectInGame(const gta5::capture::GameFrame& frame);
 void ResetInGameCache();
 void RunSession(const std::function<bool()>& stopRequested);
 int CursorSize();
@@ -22,7 +23,7 @@ LRESULT CALLBACK MarksWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 }  // namespace gta5::games::slider
 
 namespace gta5::games::flashing {
-bool DetectInGame();
+bool DetectInGame(const gta5::capture::GameFrame& frame);
 void ResetInGameCache();
 HWND OverlayWindow();
 void SetOverlayWindow(HWND hwnd);
@@ -34,7 +35,7 @@ LRESULT CALLBACK OverlayWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 }  // namespace gta5::games::flashing
 
 namespace gta5::games::choose_fingerprint {
-bool DetectInGame();
+bool DetectInGame(const gta5::capture::GameFrame& frame);
 void ResetInGameCache();
 HWND OverlayWindow();
 void SetOverlayWindow(HWND hwnd);
@@ -49,7 +50,7 @@ LRESULT CALLBACK OverlayWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 }  // namespace gta5::games::choose_fingerprint
 
 namespace gta5::games::sort_fingerprint {
-bool DetectInGame();
+bool DetectInGame(const gta5::capture::GameFrame& frame);
 void ResetInGameCache();
 void SetOverlayWindow(HWND hwnd);
 void ClearOverlay();
@@ -61,21 +62,21 @@ LRESULT CALLBACK OverlayWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 }  // namespace gta5::games::sort_fingerprint
 
 namespace gta5::games::fleeca {
-bool DetectInGame();
+bool DetectInGame(const gta5::capture::GameFrame& frame);
 void ResetInGameCache();
 bool RunSession(const std::function<bool()>& stopRequested,
                 const std::function<void(const std::wstring&)>& status);
 }  // namespace gta5::games::fleeca
 
 namespace gta5::games::find_number {
-bool DetectInGame();
+bool DetectInGame(const gta5::capture::GameFrame& frame);
 void ResetInGameCache();
 bool RunSession(const std::function<bool()>& stopRequested,
                 const std::function<void(const std::wstring&)>& status);
 }  // namespace gta5::games::find_number
 
 namespace gta5::games::match {
-bool DetectInGame();
+bool DetectInGame(const gta5::capture::GameFrame& frame);
 void ResetInGameCache();
 void SetOverlayWindow(HWND hwnd);
 void ClearOverlay();

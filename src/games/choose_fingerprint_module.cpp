@@ -1883,11 +1883,24 @@ static LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 
-bool DetectInGame() {
+bool DetectInGame(const gta5::capture::GameFrame& captured) {
   Frame f;
-  if (!captureScreen(f)) {
-    gDetectedGeometry = {};
-    return false;
+  gVirtualX = captured.screenX;
+  gVirtualY = captured.screenY;
+  gVirtualW = captured.screenW;
+  gVirtualH = captured.screenH;
+  f.x = captured.screenX; f.y = captured.screenY;
+  f.w = captured.width; f.h = captured.height;
+  f.screenW = captured.screenW; f.screenH = captured.screenH;
+  f.toScreenX = captured.toScreenX;
+  f.toScreenY = captured.toScreenY;
+  f.windowGeneration = captured.windowGeneration;
+  const uint8_t* px = reinterpret_cast<const uint8_t*>(captured.bgra.data());
+  f.bgra.assign(px, px + static_cast<size_t>(f.w) * f.h * 4);
+  f.gray.resize(static_cast<size_t>(f.w) * f.h);
+  for (int i = 0; i < f.w * f.h; ++i) {
+    const uint8_t b = px[i * 4], g = px[i * 4 + 1], r = px[i * 4 + 2];
+    f.gray[i] = static_cast<uint8_t>((77 * r + 150 * g + 29 * b) >> 8);
   }
   std::string diag;
   RoiInfo roi = detectMinigame(f, &diag);

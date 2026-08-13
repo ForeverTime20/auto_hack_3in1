@@ -682,13 +682,7 @@ void WaitFrame(const std::function<bool()>& stopRequested, Clock::time_point sta
 
 }  // namespace
 
-bool DetectInGame() {
-  Frame frame;
-  if (!gta5::capture::CaptureGameFrame(frame)) {
-    g_detectedGeometry.reset();
-    ClearOverlayState();
-    return false;
-  }
+bool DetectInGame(const gta5::capture::GameFrame& frame) {
   g_detectedGeometry = LocateGeometry(frame);
   if (!g_detectedGeometry) ClearOverlayState();
   return g_detectedGeometry.has_value();

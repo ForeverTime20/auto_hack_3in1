@@ -916,10 +916,13 @@ void DrawOverlay(HDC hdc, HWND hwnd) {
 
 }  // namespace
 
-bool DetectInGame() {
+bool DetectInGame(const gta5::capture::GameFrame& frame) {
     try {
-        ScreenCapture capture;
-        const Image screen = capture.capture();
+        Image screen;
+        screen.w = frame.width;
+        screen.h = frame.height;
+        screen.windowGeneration = frame.windowGeneration;
+        screen.view = frame.bgra.data();
         const auto headers = findHeaderBars(screen);
         const auto anchors = selectAnchors(headers, screen.w, screen.h);
         if (!anchors || !anchorsPresent(screen, *anchors) ||

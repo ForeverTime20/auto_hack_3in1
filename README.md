@@ -122,6 +122,8 @@ tap_gap_ms=20
 
 `launch_mode=0` is Resident mode, which keeps the compact status panel on top and enables optional in-game overlays. `launch_mode=1` is Silent mode: it creates no topmost or game-overlay windows, and shows a small non-topmost status notice for two seconds when the hotkey turns automation on or off.
 
+`capture_backend=0` keeps the default GDI capture path. `capture_backend=1` enables the experimental DXGI Desktop Duplication path. DXGI capture failures are reported directly and never fall back to GDI, so test results remain unambiguous.
+
 `language=0` selects Simplified Chinese, the default. `language=1` selects English. Translation text is maintained as native Windows `STRINGTABLE` resources in `src/resources/lang/zh-CN.rc` and `src/resources/lang/en-US.rc`; both files are compiled into the executable.
 
 Delay presets are `0` for Fast (`20/20 ms`), `1` for Slow (`40/40 ms`), and `2` for Custom. Timing varies by system: use Slow at low or unstable frame rates and Fast at a stable 60 FPS or higher. If inputs are missed or incorrect, adjust both values with Custom.
